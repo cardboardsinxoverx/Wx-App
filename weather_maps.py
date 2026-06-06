@@ -548,34 +548,31 @@ def draw_isobars(ax, grid_x, grid_y, grid_p, levels, fmt='%d mb'):
 
 def add_clean_colorbar(fig, ax, cf, label):
     """
-    Renders a cleanly spaced colorbar, strictly enforcing ticks within bounds 
-    and explicitly formatting labels to prevent Matplotlib ghost-stacking.
+    Renders a cleanly spaced colorbar, modified to prevent overlap with 
+    map axis labels and ensure consistent text styling.
     """
     if cf is not None:
-        cax = fig.add_axes([0.06, 0.08, 0.88, 0.025])
+        # Changed y from 0.08 to 0.05 to clear the latitude labels
+        cax = fig.add_axes([0.06, 0.05, 0.88, 0.025])
         cb = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both', extendfrac=0.04)
         
         # Colorbar Label & Outline
         cb.set_label(label, fontsize=13, fontweight='bold', color='white', labelpad=10)
         cb.ax.xaxis.label.set_path_effects(TEXT_OUTLINE)
         
-        # Define standard uniform intervals
+        # --- RETAINED YOUR ORIGINAL LOGIC ---
         if 'Temperature' in label or 'Dewpoint' in label: ticks = np.arange(-40, 131, 10)
         elif 'Relative Humidity' in label: ticks = np.arange(10, 101, 10)
         elif 'Wind Speed' in label: ticks = np.arange(20, 201, 20)
         elif 'Advection' in label or 'Vorticity' in label or 'Divergence' in label: ticks = np.arange(-20, 21, 5)
         else: ticks = cb.get_ticks()
         
-        # OVERLAP FIX: Keep ticks strictly inside or exactly on the boundaries (vmin <= t <= vmax).
-        # This brings back the Min and Max numbers on the absolute edges.
         vmin, vmax = cf.get_clim()
         valid_ticks = [t for t in ticks if vmin <= t <= vmax]
         
         cb.set_ticks(valid_ticks)
-        cb.ax.tick_params(axis='x', length=0)
+        cb.ax.tick_params(axis='x', length=0, colors='white')
         
-        # By forcing explicit string labels, we overwrite Matplotlib's native 'extend' ghost labels,
-        # which cures the double-stacked number glitch permanently.
         cb.ax.set_xticklabels([str(int(t)) for t in valid_ticks], fontsize=11, fontweight='bold', color='white')
         
         # Apply text outline to the numbers
@@ -607,9 +604,10 @@ def calc_marine_physics(water_temp_k, water_u, water_v, air_temp_f, air_dew_f, w
 def fetch_ocean_currents(extent):
     """
     Fetches MARINE Data via direct HTTP download from NOAA NOMADS.
-    Bypasses the retired OpenDAP service (SCN 25-81).
-    CRITICAL FIX: Now properly masks land points so streamplot no longer draws
-    straight lines across the continent.
+    NOW WITH:
+    - Robust Celsius/Kelvin detection (ignores fill values)
+    - Full data statistics debug output
+    - Improved ocean mask
     """
     import netCDF4 as nc
     print("\n--- MARINE DATA FETCH (RTOFS Direct Download) ---")
@@ -639,13 +637,11 @@ def fetch_ocean_currents(extent):
             print(f"• Trying {filename} for {date_str}...", end=" ", flush=True)
 
             try:
-                # 1. Check if file exists
                 head = session.head(url, timeout=10)
                 if head.status_code != 200:
                     print("Not found.")
                     continue
 
-                # 2. Download the file
                 print("Downloading...", end=" ", flush=True)
                 r = session.get(url, stream=True, timeout=30)
                 if r.status_code == 200:
@@ -658,8 +654,11 @@ def fetch_ocean_currents(extent):
 
                 print("Extracting...", end=" ", flush=True)
                 
-                # 3. Extract using low-level netCDF4
                 ds = nc.Dataset(temp_file, 'r')
+
+                # Debug: show variables
+                print(f"\n🔍 Available variables in {filename}:")
+                print(list(ds.variables.keys()))
 
                 lat_var = next((v for v in ['lat', 'Latitude', 'latitude'] if v in ds.variables), None)
                 lon_var = next((v for v in ['lon', 'Longitude', 'longitude'] if v in ds.variables), None)
@@ -671,7 +670,6 @@ def fetch_ocean_currents(extent):
                 lat_min, lat_max = extent[2] - 2, extent[3] + 2
                 lon_min, lon_max = extent[0] - 2, extent[1] + 2
 
-                # 4. Find bounding box indices
                 if lats_raw.ndim == 2:
                     mask = (lats_raw >= lat_min) & (lats_raw <= lat_max) & \
                            (lons_raw >= lon_min) & (lons_raw <= lon_max)
@@ -690,7 +688,6 @@ def fetch_ocean_currents(extent):
                 y_min_idx, y_max_idx = y_idxs.min(), y_idxs.max()
                 x_min_idx, x_max_idx = x_idxs.min(), x_idxs.max()
 
-                # Slice coordinates
                 if lats_raw.ndim == 2:
                     lats = lats_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
                     lons = lons_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
@@ -698,16 +695,23 @@ def fetch_ocean_currents(extent):
                     lats = lats_raw[y_min_idx:y_max_idx+1]
                     lons = lons_raw[x_min_idx:x_max_idx+1]
 
-                # 5. Expanded variable name candidates (robust against file changes)
+                # Variable candidates
                 sst_candidates = ['sst', 'SST', 'temperature', 'temp', 'sea_surface_temperature', 'Temperature']
-                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u']
-                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v']
+                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u',
+                                  'surf_u', 'eastward_vel', 'eastward_velocity', 'u-component_of_current']
+                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v',
+                                  'surf_v', 'northward_vel', 'northward_velocity', 'v-component_of_current']
                 sal_candidates = ['sss', 'SSS', 'salinity', 'salt', 'Salinity', 'sea_surface_salinity']
 
                 sst_var = next((v for v in sst_candidates if v in ds.variables), None)
                 u_var   = next((v for v in u_candidates   if v in ds.variables), None)
                 v_var   = next((v for v in v_candidates   if v in ds.variables), None)
                 sal_var = next((v for v in sal_candidates if v in ds.variables), None)
+
+                print(f"   → SST var: {sst_var}")
+                print(f"   → U var:   {u_var}")
+                print(f"   → V var:   {v_var}")
+                print(f"   → Sal var: {sal_var}")
 
                 def safe_slice(vname):
                     if not vname: return None
@@ -724,8 +728,6 @@ def fetch_ocean_currents(extent):
                     w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
                 else:
                     w_temp = np.asarray(w_temp, dtype=np.float32)
-                    if np.nanmax(w_temp) < 100:          # likely Celsius → convert to Kelvin
-                        w_temp += 273.15
 
                 w_u = safe_slice(u_var)
                 if w_u is None:
@@ -745,14 +747,32 @@ def fetch_ocean_currents(extent):
                 else:
                     salinity = np.asarray(salinity, dtype=np.float32)
 
-                # === CRITICAL FIX: Ocean mask to kill straight-line artifacts ===
-                # Only keep points with realistic ocean SST (Kelvin)
-                ocean_mask = np.isfinite(w_temp) & (w_temp > 270) & (w_temp < 310)
-                
+                # === ROBUST UNIT DETECTION (fixes the mask bug) ===
+                print(f"   SST raw range: {np.nanmin(w_temp):.2f} to {np.nanmax(w_temp):.2f}")
+                print(f"   U raw range:   {np.nanmin(w_u):.2f} to {np.nanmax(w_u):.2f}")
+                print(f"   V raw range:   {np.nanmin(w_v):.2f} to {np.nanmax(w_v):.2f}")
+
+                # Ignore fill values when deciding units
+                valid_temp = w_temp[np.isfinite(w_temp) & (w_temp > -50) & (w_temp < 100)]
+                if len(valid_temp) > 10 and np.nanmax(valid_temp) < 100:
+                    w_temp = np.where(np.isfinite(w_temp), w_temp + 273.15, w_temp)
+                    print("   → Converted SST from °C to K")
+
+                # === IMPROVED OCEAN MASK ===
+                ocean_mask = (np.isfinite(w_temp) & 
+                             (w_temp > 270) & (w_temp < 310) & 
+                             np.isfinite(w_u) & np.isfinite(w_v))  # also require valid currents
+
                 w_temp = np.where(ocean_mask, w_temp, np.nan)
                 w_u    = np.where(ocean_mask, w_u,    np.nan)
                 w_v    = np.where(ocean_mask, w_v,    np.nan)
                 salinity = np.where(ocean_mask, salinity, np.nan)
+
+                # Final stats
+                valid_ocean = np.sum(np.isfinite(w_u))
+                print(f"   After mask → {valid_ocean:,} valid ocean points")
+                if valid_ocean > 0:
+                    print(f"   U after mask range: {np.nanmin(w_u):.3f} to {np.nanmax(w_u):.3f} m/s")
 
                 print("Success! ✅ (ocean masked)")
                 ds.close()
@@ -788,8 +808,8 @@ def generate_mslp_temp_map():
     
     # Heuristic: determine which source likely provided the data for logging
     try:
-        if ncom_sal is not None and np.any(~np.isnan(ncom_sal) & (ncom_sal != 0)):
-            _marine_source = 'RTOFS/HYCOM (salinity present)'
+        if ncom_u is not None and np.any(np.isfinite(ncom_u)):
+            _marine_source = 'RTOFS (currents present)'
         else:
             _marine_source = 'IEM mesonet (station-gridded)'
     except Exception:
@@ -850,7 +870,16 @@ def generate_mslp_temp_map():
             
             # Dedicated colorbar for ocean temperature
             cax_marine = fig.add_axes([0.02, 0.2, 0.015, 0.5])
-            fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (K)')
+            cbar = fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (K)', extend='both')
+            
+            # Match the styling to your main colorbar
+            cbar.set_label('Ocean Temp (K)', fontsize=11, fontweight='bold', color='white')
+            cbar.ax.yaxis.label.set_path_effects(TEXT_OUTLINE)
+            cbar.ax.tick_params(axis='y', colors='white')
+            
+            for tick_label in cbar.ax.get_yticklabels():
+                tick_label.set_path_effects(TEXT_OUTLINE)
+                tick_label.set_fontweight('bold')
             
             print("Done. ✅")
         except Exception as e:
