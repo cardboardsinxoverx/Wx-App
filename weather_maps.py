@@ -589,11 +589,12 @@ def add_clean_colorbar(fig, ax, cf, label):
 
 def calc_marine_physics(water_temp_k, water_u, water_v, air_temp_f, air_dew_f, wind_speed_kts):
     """Calculates Latent Heat Flux potential and Ocean Vorticity (Upwelling)."""
-    grad_v = np.gradient(water_v)
-    dv_dx = grad_v[1] 
+    # NaN-safe gradients (land points are now NaN)
+    grad_v = np.gradient(np.ma.masked_invalid(water_v))
+    dv_dx = grad_v[1]
     
-    grad_u = np.gradient(water_u)
-    du_dy = grad_u[0] 
+    grad_u = np.gradient(np.ma.masked_invalid(water_u))
+    du_dy = grad_u[0]
     
     vorticity = dv_dx - du_dy
     water_c = water_temp_k - 273.15
@@ -607,8 +608,8 @@ def fetch_ocean_currents(extent):
     """
     Fetches MARINE Data via direct HTTP download from NOAA NOMADS.
     Bypasses the retired OpenDAP service (SCN 25-81).
-    CRITICAL FIX: Bypasses `xarray` entirely and uses raw `netCDF4` 
-    to permanently prevent the 2D PandasIndex crash.
+    CRITICAL FIX: Now properly masks land points so streamplot no longer draws
+    straight lines across the continent.
     """
     import netCDF4 as nc
     print("\n--- MARINE DATA FETCH (RTOFS Direct Download) ---")
@@ -657,7 +658,7 @@ def fetch_ocean_currents(extent):
 
                 print("Extracting...", end=" ", flush=True)
                 
-                # 3. Extract using low-level netCDF4 (IMMUNE TO PANDAS CRASHES)
+                # 3. Extract using low-level netCDF4
                 ds = nc.Dataset(temp_file, 'r')
 
                 lat_var = next((v for v in ['lat', 'Latitude', 'latitude'] if v in ds.variables), None)
@@ -697,11 +698,16 @@ def fetch_ocean_currents(extent):
                     lats = lats_raw[y_min_idx:y_max_idx+1]
                     lons = lons_raw[x_min_idx:x_max_idx+1]
 
-                # 5. Extract Data safely across dimensions
-                sst_var = next((v for v in ['sst', 'SST', 'temperature'] if v in ds.variables), None)
-                u_var = next((v for v in ['u_velocity', 'u'] if v in ds.variables), None)
-                v_var = next((v for v in ['v_velocity', 'v'] if v in ds.variables), None)
-                sal_var = next((v for v in ['sss', 'SSS', 'salinity'] if v in ds.variables), None)
+                # 5. Expanded variable name candidates (robust against file changes)
+                sst_candidates = ['sst', 'SST', 'temperature', 'temp', 'sea_surface_temperature', 'Temperature']
+                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u']
+                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v']
+                sal_candidates = ['sss', 'SSS', 'salinity', 'salt', 'Salinity', 'sea_surface_salinity']
+
+                sst_var = next((v for v in sst_candidates if v in ds.variables), None)
+                u_var   = next((v for v in u_candidates   if v in ds.variables), None)
+                v_var   = next((v for v in v_candidates   if v in ds.variables), None)
+                sal_var = next((v for v in sal_candidates if v in ds.variables), None)
 
                 def safe_slice(vname):
                     if not vname: return None
@@ -712,20 +718,43 @@ def fetch_ocean_currents(extent):
                     if ndim == 4: return var_obj[0, 0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
                     return None
 
+                # Extract raw data
                 w_temp = safe_slice(sst_var)
-                if w_temp is None: w_temp = np.zeros(lats.shape)
-                elif np.nanmax(w_temp) < 100: w_temp += 273.15 
+                if w_temp is None:
+                    w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
+                else:
+                    w_temp = np.asarray(w_temp, dtype=np.float32)
+                    if np.nanmax(w_temp) < 100:          # likely Celsius → convert to Kelvin
+                        w_temp += 273.15
 
                 w_u = safe_slice(u_var)
-                if w_u is None: w_u = np.zeros_like(w_temp)
+                if w_u is None:
+                    w_u = np.full_like(w_temp, np.nan)
+                else:
+                    w_u = np.asarray(w_u, dtype=np.float32)
 
                 w_v = safe_slice(v_var)
-                if w_v is None: w_v = np.zeros_like(w_temp)
+                if w_v is None:
+                    w_v = np.full_like(w_temp, np.nan)
+                else:
+                    w_v = np.asarray(w_v, dtype=np.float32)
 
                 salinity = safe_slice(sal_var)
-                if salinity is None: salinity = np.zeros_like(w_temp)
+                if salinity is None:
+                    salinity = np.full_like(w_temp, np.nan)
+                else:
+                    salinity = np.asarray(salinity, dtype=np.float32)
 
-                print("Success! ✅")
+                # === CRITICAL FIX: Ocean mask to kill straight-line artifacts ===
+                # Only keep points with realistic ocean SST (Kelvin)
+                ocean_mask = np.isfinite(w_temp) & (w_temp > 270) & (w_temp < 310)
+                
+                w_temp = np.where(ocean_mask, w_temp, np.nan)
+                w_u    = np.where(ocean_mask, w_u,    np.nan)
+                w_v    = np.where(ocean_mask, w_v,    np.nan)
+                salinity = np.where(ocean_mask, salinity, np.nan)
+
+                print("Success! ✅ (ocean masked)")
                 ds.close()
                 if os.path.exists(temp_file): os.remove(temp_file)
                     
@@ -756,6 +785,7 @@ def generate_mslp_temp_map():
     hrrr_data = fetch_hrrr_sfc(EXTENT)
     rtma_data = fetch_rtma_sfc(EXTENT)
     ncom_lat, ncom_lon, ncom_temp_k, ncom_u, ncom_v, ncom_sal = fetch_ocean_currents(EXTENT)
+    
     # Heuristic: determine which source likely provided the data for logging
     try:
         if ncom_sal is not None and np.any(~np.isnan(ncom_sal) & (ncom_sal != 0)):
@@ -793,20 +823,21 @@ def generate_mslp_temp_map():
                               transform=ccrs.PlateCarree(), extend='both', alpha=0.85, zorder=1.5)
 
     # === PLOT MARINE OCEAN CURRENTS ===
-    if ncom_lat is not None and g_temp is not None:
+    if (ncom_lat is not None and 
+        ncom_u is not None and 
+        np.any(np.isfinite(ncom_u))):   # ← only plot if we actually have valid ocean data
         print("• Plotting Marine/Ocean Layer (Dynamic/Outlined)...", end=" ", flush=True)
         try:
             # NO MESHGRID: Use raw RTOFS 2D arrays directly
             nc_x, nc_y = ncom_lon, ncom_lat
             marine_vort, _, _ = calc_marine_physics(ncom_temp_k, ncom_u, ncom_v, 70, 60, 10)
 
-            # 1. Vorticity contours (kept for upwelling identification)
+            # 1. Vorticity contours
             ax.contour(nc_x, nc_y, marine_vort, levels=[-0.0001, -0.00005, 0.00005, 0.0001],
                        colors=['blue', 'cyan', 'orange', 'red'], linewidths=1.2,
                        alpha=0.6, transform=ccrs.PlateCarree(), zorder=1.56)
 
-            # 2. Dynamic Streamplot (Colored by SST, Outlined)
-            # We use 'turbo' or 'plasma' for high-contrast temperature visualization
+            # 2. Dynamic Streamplot (now cleanly stops at coastlines)
             stride = 6
             strm = ax.streamplot(nc_x[::stride, ::stride], nc_y[::stride, ::stride], 
                                  ncom_u[::stride, ::stride], ncom_v[::stride, ::stride], 
@@ -814,11 +845,10 @@ def generate_mslp_temp_map():
                                  density=1.2, linewidth=1.5, arrowsize=1.5,
                                  transform=ccrs.PlateCarree(), zorder=2.0)
             
-            # Apply the "Isobar-style" outline to the streamplot lines
+            # Isobar-style outline
             strm.lines.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
             
-            # Add a dedicated colorbar for the ocean temperature
-            # This is plotted on the left side to avoid conflicting with the surface temp bar
+            # Dedicated colorbar for ocean temperature
             cax_marine = fig.add_axes([0.02, 0.2, 0.015, 0.5])
             fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (K)')
             
