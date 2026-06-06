@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Advanced CONUS Weather Map Generator
-Surface Maps: Blended HRRR/RAP with explicit high-terrain hypsometric reduction.
-Upper Air Maps: RAP (Rapid Refresh) 13km High-Resolution Data.
+Surface Maps: Blended HRRR/RAP/RTMA with explicit high-terrain hypsometric reduction.
+Upper Air Maps: Blended RAP (13km) + GFS (0.25deg) Isobaric Data.
 Includes universal 4 dam upper-air intervals, dynamic colorbar locators, and optimized wind barbs.
 """
 
@@ -191,7 +191,7 @@ def frontogenesis_700hPa(T, u, v, lat, lon):
         return None
 
 # ====================================================================
-# 3. Model Fetchers
+# 3. Model Fetchers (Surface & Upper-Air)
 # ====================================================================
 
 def fetch_rap_full(extent):
@@ -303,91 +303,6 @@ def fetch_hrrr_sfc(extent):
         logging.error(f"HRRR Surface Fetch Failed: {e}")
         return None
 
-def blend_surface_models(rap_data, hrrr_data, rtma_data, extent):
-    """
-    Blends the broad RAP background, high-res HRRR forecast, 
-    and ground-truth RTMA observations into a single cohesive point cloud.
-    Includes a Strict Reality Filter to safely destroy -9999.0 THREDDS fill-values.
-    """
-    logging.info("Blending Unified High-Terrain Surface Models (RAP/HRRR/RTMA)...")
-    grid_lon = np.arange(extent[0]-0.5, extent[1]+0.5, 0.1)
-    grid_lat = np.arange(extent[2]-0.5, extent[3]+0.5, 0.1)
-    grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
-    
-    points, temps, us, vs, press = [], [], [], [], []
-    
-    def add_to_blend(data_dict, step):
-        if not data_dict: return
-        
-        lon_arr = data_dict['lon'][::step, ::step].flatten()
-        lat_arr = data_dict['lat'][::step, ::step].flatten()
-        t_arr = data_dict['temp'][::step, ::step].flatten()
-        u_arr = data_dict['u'][::step, ::step].flatten()
-        v_arr = data_dict['v'][::step, ::step].flatten()
-        
-        has_p = data_dict.get('pressure') is not None
-        
-        # 1. Fill masked arrays with NaN
-        t_clean = np.ma.filled(t_arr, np.nan)
-        u_clean = np.ma.filled(u_arr, np.nan)
-        v_clean = np.ma.filled(v_arr, np.nan)
-        
-        # 2. THE REALITY FILTER: Explicitly bounds the data to realistic meteorological limits.
-        # This prevents THREDDS -9999.0 fill values from causing massive black tears over the oceans.
-        valid = (~np.isnan(t_clean)) & (t_clean > -100) & (t_clean < 150)
-        valid &= (~np.isnan(u_clean)) & (np.abs(u_clean) < 200)
-        valid &= (~np.isnan(v_clean)) & (np.abs(v_clean) < 200)
-        
-        if has_p:
-            p_arr = data_dict['pressure'][::step, ::step].flatten()
-            p_clean = np.ma.filled(p_arr, np.nan)
-            valid &= (~np.isnan(p_clean)) & (p_clean > 800) & (p_clean < 1150)
-            
-        lon_arr = np.where(lon_arr > 180, lon_arr - 360, lon_arr)
-        
-        # Only append data that survives the Reality Filter
-        points.append(np.column_stack((lon_arr[valid], lat_arr[valid])))
-        temps.append(t_clean[valid])
-        us.append(u_clean[valid])
-        vs.append(v_clean[valid])
-        if has_p:
-            press.append(p_clean[valid])
-
-    # Combine models into a unified point cloud
-    add_to_blend(rap_data, 1)
-    add_to_blend(hrrr_data, 3)
-    add_to_blend(rtma_data, 3)
-
-    if not points: return None, None, None, None, None, None
-
-    all_points = np.vstack(points)
-    all_temps = np.concatenate(temps)
-    all_us = np.concatenate(us)
-    all_vs = np.concatenate(vs)
-    all_press = np.concatenate(press) if press else None
-    
-    def interp_safe(vals, sigma=1.0):
-        # Uses Delaunay triangulation across the unified point cloud for a perfectly smooth gradient
-        res = griddata(all_points, vals, (grid_x, grid_y), method='linear')
-        mask_nan = np.isnan(res)
-        if np.any(mask_nan):
-            res[mask_nan] = griddata(all_points, vals, (grid_x[mask_nan], grid_y[mask_nan]), method='nearest')
-        return gaussian_filter(res, sigma=sigma) 
-
-    try:
-        # Standard smoothing restores the gorgeous, seamless color transitions
-        g_temp = interp_safe(all_temps, sigma=1.0)
-        g_u = interp_safe(all_us, sigma=1.0)
-        g_v = interp_safe(all_vs, sigma=1.0)
-        
-        # Heavier smoothing (4.0) applies ONLY to pressure to clean up the noisy Rockies isobars
-        g_p = interp_safe(all_press, sigma=4.0) if all_press is not None else None
-        
-        return grid_y, grid_x, g_temp, g_u, g_v, g_p
-    except Exception as e:
-        logging.error(f"Blending failed: {e}")
-        return None, None, None, None, None, None
-
 def fetch_rtma_sfc(extent):
     logging.info("Fetching RTMA 2.5km Surface Analysis...")
     try:
@@ -399,7 +314,6 @@ def fetch_rtma_sfc(extent):
         ncss = ds.subset()
         available = set(ncss.variables)
         
-        # Restored the robust fuzzy matcher 
         def get_best_match(keywords, fallback):
             for kw in keywords:
                 if kw in available: return kw
@@ -449,144 +363,179 @@ def fetch_rtma_sfc(extent):
     except Exception as e:
         logging.error(f"RTMA Fetch Failed: {e}")
         return None
-    
-def get_rap_data_for_level(level):
-    logging.info(f"Fetching RAP 13km Data for {level} Pa...")
-    catalog_url = 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/RAP/CONUS_13km/latest.xml'
-    try:
-        cat = TDSCatalog(catalog_url)
-        latest_dataset = cat.datasets[0]
-        ncss = latest_dataset.subset()
 
-        query = ncss.query()
+# --- NEW: UNIFIED UPPER AIR ISO-LEVEL FETCHER (RAP + GFS) ---
+def fetch_upper_air_model(model_name, level):
+    logging.info(f"Fetching {model_name} isobaric data for {level} Pa...")
+    catalogs = {
+        'RAP': 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/RAP/CONUS_13km/latest.xml',
+        'GFS': 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/GFS/CONUS_0p25/latest.xml'
+    }
+    
+    if model_name not in catalogs:
+        logging.error(f"Model {model_name} not supported.")
+        return None
+
+    try:
+        cat = TDSCatalog(catalogs[model_name])
+        ds = cat.datasets[0].subset()
+        query = ds.query()
+        query.lonlat_box(north=55, south=15, east=-60, west=-130)
         query.accept('netcdf4')
         query.add_lonlat(True)
-        query.time(datetime.now(timezone.utc))
-        query.variables('Geopotential_height_isobaric',
-                        'u-component_of_wind_isobaric',
-                        'v-component_of_wind_isobaric',
-                        'Relative_humidity_isobaric',
-                        'Temperature_isobaric')
+        query.variables('Geopotential_height_isobaric', 'u-component_of_wind_isobaric', 
+                        'v-component_of_wind_isobaric', 'Temperature_isobaric', 'Relative_humidity_isobaric')
         query.vertical_level([level])
-        query.lonlat_box(north=55, south=15, east=-60, west=-130)
-
-        data = ncss.get_data(query)
-        ds = xr.open_dataset(xr.backends.NetCDF4DataStore(data))
         
-        time_var = next((v for v in ds.variables if 'time' in v.lower()), None)
-        if time_var is not None:
-            time_val = ds[time_var].values
-            run_date = pd.to_datetime(time_val[0]).to_pydatetime() if isinstance(time_val, np.ndarray) else pd.to_datetime(time_val).to_pydatetime()
-        else:
-            run_date = datetime.now(timezone.utc)
-            
-        return ds, run_date
+        data = ds.get_data(query)
+        
+        # Helper to safely extract squeezed arrays
+        def get_var(name):
+            try:
+                var = data.variables[name][:].squeeze()
+                # Ensure 2D arrays if single timestep exists
+                if var.ndim == 3: var = var[0]
+                return var
+            except Exception:
+                return None
+
+        return {
+            'lat': get_var('lat'),
+            'lon': get_var('lon'),
+            'hgt': get_var('Geopotential_height_isobaric'),
+            'u': get_var('u-component_of_wind_isobaric'),
+            'v': get_var('v-component_of_wind_isobaric'),
+            'temp': get_var('Temperature_isobaric'),
+            'rh': get_var('Relative_humidity_isobaric')
+        }
     except Exception as e:
-        logging.error(f"Error fetching RAP upper-air: {e}")
-        return None, None
-
-def get_dynamic_time_dims(ds):
-    time_dims = {}
-    for dim in ds.dims:
-        if 'time' in dim.lower(): time_dims[dim] = 0
-    return time_dims
+        logging.error(f"Fetch failed for {model_name} at {level} Pa: {e}")
+        return None
 
 # ====================================================================
-# 4. OVERLAYS, LAYOUT MANAGERS, & COLORBARS
+# 4. BLENDERS
 # ====================================================================
 
-def draw_interstates_from_shapefile(ax, shapefile=INTERSTATES_SHP):
-    if not os.path.exists(shapefile): return
+def blend_surface_models(rap_data, hrrr_data, rtma_data, extent):
+    logging.info("Blending Unified High-Terrain Surface Models (RAP/HRRR/RTMA)...")
+    grid_lon = np.arange(extent[0]-0.5, extent[1]+0.5, 0.1)
+    grid_lat = np.arange(extent[2]-0.5, extent[3]+0.5, 0.1)
+    grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
+    
+    points, temps, us, vs, press = [], [], [], [], []
+    
+    def add_to_blend(data_dict, step):
+        if not data_dict: return
+        
+        lon_arr = data_dict['lon'][::step, ::step].flatten()
+        lat_arr = data_dict['lat'][::step, ::step].flatten()
+        t_arr = data_dict['temp'][::step, ::step].flatten()
+        u_arr = data_dict['u'][::step, ::step].flatten()
+        v_arr = data_dict['v'][::step, ::step].flatten()
+        
+        has_p = data_dict.get('pressure') is not None
+        
+        t_clean = np.ma.filled(t_arr, np.nan)
+        u_clean = np.ma.filled(u_arr, np.nan)
+        v_clean = np.ma.filled(v_arr, np.nan)
+        
+        valid = (~np.isnan(t_clean)) & (t_clean > -100) & (t_clean < 150)
+        valid &= (~np.isnan(u_clean)) & (np.abs(u_clean) < 200)
+        valid &= (~np.isnan(v_clean)) & (np.abs(v_clean) < 200)
+        
+        if has_p:
+            p_arr = data_dict['pressure'][::step, ::step].flatten()
+            p_clean = np.ma.filled(p_arr, np.nan)
+            valid &= (~np.isnan(p_clean)) & (p_clean > 800) & (p_clean < 1150)
+            
+        lon_arr = np.where(lon_arr > 180, lon_arr - 360, lon_arr)
+        
+        points.append(np.column_stack((lon_arr[valid], lat_arr[valid])))
+        temps.append(t_clean[valid])
+        us.append(u_clean[valid])
+        vs.append(v_clean[valid])
+        if has_p:
+            press.append(p_clean[valid])
+
+    add_to_blend(rap_data, 1)
+    add_to_blend(hrrr_data, 3)
+    add_to_blend(rtma_data, 3)
+
+    if not points: return None, None, None, None, None, None
+
+    all_points = np.vstack(points)
+    all_temps = np.concatenate(temps)
+    all_us = np.concatenate(us)
+    all_vs = np.concatenate(vs)
+    all_press = np.concatenate(press) if press else None
+    
+    def interp_safe(vals, sigma=1.0):
+        res = griddata(all_points, vals, (grid_x, grid_y), method='linear')
+        mask_nan = np.isnan(res)
+        if np.any(mask_nan):
+            res[mask_nan] = griddata(all_points, vals, (grid_x[mask_nan], grid_y[mask_nan]), method='nearest')
+        return gaussian_filter(res, sigma=sigma) 
+
     try:
-        reader = shpreader.Reader(shapefile)
-        interstate_geoms = []
-        for record, geometry in zip(reader.records(), reader.geometries()):
-            attrs = record.attributes if hasattr(record, 'attributes') else record.__dict__
-            is_interstate = False
-            for key in ('RTTYP', 'RTE_TYPE', 'MTFCC'):
-                if key in attrs and str(attrs.get(key)).upper() == 'I': is_interstate = True
-            if not is_interstate and 'FULLNAME' in attrs and 'INTERSTATE' in str(attrs.get('FULLNAME')).upper():
-                is_interstate = True
-            if is_interstate: interstate_geoms.append(geometry)
-        if interstate_geoms:
-            ax.add_geometries(interstate_geoms, ccrs.PlateCarree(), edgecolor='#D14900', 
-                              facecolor='none', linewidth=1.2, zorder=3.5, alpha=0.9)
-    except Exception as e: pass
+        g_temp = interp_safe(all_temps, sigma=1.0)
+        g_u = interp_safe(all_us, sigma=1.0)
+        g_v = interp_safe(all_vs, sigma=1.0)
+        g_p = interp_safe(all_press, sigma=4.0) if all_press is not None else None
+        
+        return grid_y, grid_x, g_temp, g_u, g_v, g_p
+    except Exception as e:
+        logging.error(f"Blending failed: {e}")
+        return None, None, None, None, None, None
 
-def draw_major_cities(ax):
-    cities = {
-        'Seattle': (-122.33, 47.60), 'Los Angeles': (-118.24, 34.05),
-        'Denver': (-104.99, 39.73), 'Chicago': (-87.62, 41.87),
-        'New York': (-74.00, 40.71), 'Houston': (-95.36, 29.76),
-        'Miami': (-80.19, 25.76), 'Atlanta': (-84.38, 33.74),
-        'Cartersville': (-84.80, 34.16)
-    }
-    for name, (lon, lat) in cities.items():
-        ax.plot(lon, lat, marker='o', color='white', markeredgecolor='black', markersize=5, transform=ccrs.PlateCarree(), zorder=5)
-        ax.text(lon + 0.5, lat + 0.5, name, color='white', fontsize=11, fontweight='bold',
-                path_effects=TEXT_OUTLINE, transform=ccrs.PlateCarree(), zorder=6)
-
-def draw_isobars(ax, grid_x, grid_y, grid_p, levels, fmt='%d mb'):
-    """
-    Renders clean, high-visibility isobars.
-    White center line with a persistent black 'halo' outline.
-    """
-    cs = ax.contour(grid_x, grid_y, grid_p, levels=levels, 
-                    colors='white', linewidths=1.8, zorder=2.0, transform=ccrs.PlateCarree())
+# --- NEW: UNIFIED UPPER AIR BLENDER (RAP + GFS) ---
+def blend_upper_air_models(data_list, extent):
+    logging.info("Blending Upper-Air Models...")
+    grid_lon = np.arange(extent[0]-0.5, extent[1]+0.5, 0.1)
+    grid_lat = np.arange(extent[2]-0.5, extent[3]+0.5, 0.1)
+    grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
     
-    # Line Outline
-    cs.set_path_effects([pe.Stroke(linewidth=3.5, foreground='black'), pe.Normal()])
+    pts, hgts, us, vs, temps, rhs = [], [], [], [], [], []
     
-    # Text Labels
-    clabels = ax.clabel(cs, fmt=fmt, inline=True, inline_spacing=12, fontsize=10, colors='white')
+    for d in data_list:
+        if not d or d['hgt'] is None: continue
+        
+        lon = np.where(d['lon'] > 180, d['lon'] - 360, d['lon']).flatten()
+        lat = d['lat'].flatten()
+        
+        # Validate grid points
+        valid = (~np.isnan(d['hgt'].flatten())) & (~np.isnan(d['temp'].flatten()))
+        
+        pts.append(np.column_stack((lon[valid], lat[valid])))
+        hgts.append(d['hgt'].flatten()[valid])
+        us.append(d['u'].flatten()[valid])
+        vs.append(d['v'].flatten()[valid])
+        temps.append(d['temp'].flatten()[valid])
+        
+        if d['rh'] is not None: rhs.append(d['rh'].flatten()[valid])
+        else: rhs.append(np.zeros_like(d['hgt'].flatten()[valid])) # safety fallback
+        
+    if not pts: return None, None, None, None, None, None, None
     
-    for label in clabels:
-        label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
-        label.set_fontweight('bold')
+    all_pts = np.vstack(pts)
+    
+    def interp(vals, sigma=1.5):
+        res = griddata(all_pts, np.concatenate(vals), (grid_x, grid_y), method='linear')
+        mask = np.isnan(res)
+        if np.any(mask):
+            res[mask] = griddata(all_pts, np.concatenate(vals), (grid_x[mask], grid_y[mask]), method='nearest')
+        return gaussian_filter(res, sigma=sigma)
         
-    return cs
-
-def add_clean_colorbar(fig, ax, cf, label):
-    """
-    Renders a cleanly spaced colorbar, modified to prevent overlap with 
-    map axis labels and ensure consistent text styling.
-    """
-    if cf is not None:
-        # Changed y from 0.08 to 0.05 to clear the latitude labels
-        cax = fig.add_axes([0.06, 0.05, 0.88, 0.025])
-        cb = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both', extendfrac=0.04)
-        
-        # Colorbar Label & Outline
-        cb.set_label(label, fontsize=13, fontweight='bold', color='white', labelpad=10)
-        cb.ax.xaxis.label.set_path_effects(TEXT_OUTLINE)
-        
-        # --- RETAINED YOUR ORIGINAL LOGIC ---
-        if 'Temperature' in label or 'Dewpoint' in label: ticks = np.arange(-40, 131, 10)
-        elif 'Relative Humidity' in label: ticks = np.arange(10, 101, 10)
-        elif 'Wind Speed' in label: ticks = np.arange(20, 201, 20)
-        elif 'Advection' in label or 'Vorticity' in label or 'Divergence' in label: ticks = np.arange(-20, 21, 5)
-        else: ticks = cb.get_ticks()
-        
-        vmin, vmax = cf.get_clim()
-        valid_ticks = [t for t in ticks if vmin <= t <= vmax]
-        
-        cb.set_ticks(valid_ticks)
-        cb.ax.tick_params(axis='x', length=0, colors='white')
-        
-        cb.ax.set_xticklabels([str(int(t)) for t in valid_ticks], fontsize=11, fontweight='bold', color='white')
-        
-        # Apply text outline to the numbers
-        for tick_label in cb.ax.get_xticklabels():
-            tick_label.set_path_effects(TEXT_OUTLINE)
-
+    try:
+        return grid_x, grid_y, interp(hgts, 2.0), interp(us), interp(vs), interp(temps), interp(rhs)
+    except Exception as e:
+        logging.error(f"Upper-Air Blending failed: {e}")
+        return None, None, None, None, None, None, None
 
 # ==========================================
 # --- NAVY / MARINE MODULE ---
 # ==========================================
 
 def calc_marine_physics(water_temp_k, water_u, water_v, air_temp_f, air_dew_f, wind_speed_kts):
-    """Calculates Latent Heat Flux potential and Ocean Vorticity (Upwelling)."""
-    # NaN-safe gradients (land points are now NaN)
     grad_v = np.gradient(np.ma.masked_invalid(water_v))
     dv_dx = grad_v[1]
     
@@ -602,13 +551,6 @@ def calc_marine_physics(water_temp_k, water_u, water_v, air_temp_f, air_dew_f, w
 
 
 def fetch_ocean_currents(extent):
-    """
-    Fetches MARINE Data via direct HTTP download from NOAA NOMADS.
-    NOW WITH:
-    - Robust Celsius/Kelvin detection (ignores fill values)
-    - Full data statistics debug output
-    - Improved ocean mask
-    """
     import netCDF4 as nc
     print("\n--- MARINE DATA FETCH (RTOFS Direct Download) ---")
     logging.info("Attempting to fetch RTOFS data via direct HTTPS...")
@@ -656,10 +598,6 @@ def fetch_ocean_currents(extent):
                 
                 ds = nc.Dataset(temp_file, 'r')
 
-                # Debug: show variables
-                print(f"\n🔍 Available variables in {filename}:")
-                print(list(ds.variables.keys()))
-
                 lat_var = next((v for v in ['lat', 'Latitude', 'latitude'] if v in ds.variables), None)
                 lon_var = next((v for v in ['lon', 'Longitude', 'longitude'] if v in ds.variables), None)
 
@@ -695,23 +633,15 @@ def fetch_ocean_currents(extent):
                     lats = lats_raw[y_min_idx:y_max_idx+1]
                     lons = lons_raw[x_min_idx:x_max_idx+1]
 
-                # Variable candidates
                 sst_candidates = ['sst', 'SST', 'temperature', 'temp', 'sea_surface_temperature', 'Temperature']
-                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u',
-                                  'surf_u', 'eastward_vel', 'eastward_velocity', 'u-component_of_current']
-                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v',
-                                  'surf_v', 'northward_vel', 'northward_velocity', 'v-component_of_current']
+                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u', 'surf_u', 'eastward_vel']
+                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v', 'surf_v', 'northward_vel']
                 sal_candidates = ['sss', 'SSS', 'salinity', 'salt', 'Salinity', 'sea_surface_salinity']
 
                 sst_var = next((v for v in sst_candidates if v in ds.variables), None)
                 u_var   = next((v for v in u_candidates   if v in ds.variables), None)
                 v_var   = next((v for v in v_candidates   if v in ds.variables), None)
                 sal_var = next((v for v in sal_candidates if v in ds.variables), None)
-
-                print(f"   → SST var: {sst_var}")
-                print(f"   → U var:   {u_var}")
-                print(f"   → V var:   {v_var}")
-                print(f"   → Sal var: {sal_var}")
 
                 def safe_slice(vname):
                     if not vname: return None
@@ -722,57 +652,32 @@ def fetch_ocean_currents(extent):
                     if ndim == 4: return var_obj[0, 0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
                     return None
 
-                # Extract raw data
                 w_temp = safe_slice(sst_var)
-                if w_temp is None:
-                    w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
-                else:
-                    w_temp = np.asarray(w_temp, dtype=np.float32)
+                if w_temp is None: w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
+                else: w_temp = np.asarray(w_temp, dtype=np.float32)
 
                 w_u = safe_slice(u_var)
-                if w_u is None:
-                    w_u = np.full_like(w_temp, np.nan)
-                else:
-                    w_u = np.asarray(w_u, dtype=np.float32)
+                if w_u is None: w_u = np.full_like(w_temp, np.nan)
+                else: w_u = np.asarray(w_u, dtype=np.float32)
 
                 w_v = safe_slice(v_var)
-                if w_v is None:
-                    w_v = np.full_like(w_temp, np.nan)
-                else:
-                    w_v = np.asarray(w_v, dtype=np.float32)
+                if w_v is None: w_v = np.full_like(w_temp, np.nan)
+                else: w_v = np.asarray(w_v, dtype=np.float32)
 
                 salinity = safe_slice(sal_var)
-                if salinity is None:
-                    salinity = np.full_like(w_temp, np.nan)
-                else:
-                    salinity = np.asarray(salinity, dtype=np.float32)
+                if salinity is None: salinity = np.full_like(w_temp, np.nan)
+                else: salinity = np.asarray(salinity, dtype=np.float32)
 
-                # === ROBUST UNIT DETECTION (fixes the mask bug) ===
-                print(f"   SST raw range: {np.nanmin(w_temp):.2f} to {np.nanmax(w_temp):.2f}")
-                print(f"   U raw range:   {np.nanmin(w_u):.2f} to {np.nanmax(w_u):.2f}")
-                print(f"   V raw range:   {np.nanmin(w_v):.2f} to {np.nanmax(w_v):.2f}")
-
-                # Ignore fill values when deciding units
                 valid_temp = w_temp[np.isfinite(w_temp) & (w_temp > -50) & (w_temp < 100)]
                 if len(valid_temp) > 10 and np.nanmax(valid_temp) < 100:
                     w_temp = np.where(np.isfinite(w_temp), w_temp + 273.15, w_temp)
-                    print("   → Converted SST from °C to K")
 
-                # === IMPROVED OCEAN MASK ===
-                ocean_mask = (np.isfinite(w_temp) & 
-                             (w_temp > 270) & (w_temp < 310) & 
-                             np.isfinite(w_u) & np.isfinite(w_v))  # also require valid currents
+                ocean_mask = (np.isfinite(w_temp) & (w_temp > 270) & (w_temp < 310) & np.isfinite(w_u) & np.isfinite(w_v)) 
 
                 w_temp = np.where(ocean_mask, w_temp, np.nan)
                 w_u    = np.where(ocean_mask, w_u,    np.nan)
                 w_v    = np.where(ocean_mask, w_v,    np.nan)
                 salinity = np.where(ocean_mask, salinity, np.nan)
-
-                # Final stats
-                valid_ocean = np.sum(np.isfinite(w_u))
-                print(f"   After mask → {valid_ocean:,} valid ocean points")
-                if valid_ocean > 0:
-                    print(f"   U after mask range: {np.nanmin(w_u):.3f} to {np.nanmax(w_u):.3f} m/s")
 
                 print("Success! ✅ (ocean masked)")
                 ds.close()
@@ -794,7 +699,78 @@ def fetch_ocean_currents(extent):
     return None, None, None, None, None, None
 
 # ====================================================================
-# 5. CORE GENERATION PLOTS 
+# 5. OVERLAYS & COLORBARS
+# ====================================================================
+
+def draw_interstates_from_shapefile(ax, shapefile=INTERSTATES_SHP):
+    if not os.path.exists(shapefile): return
+    try:
+        reader = shpreader.Reader(shapefile)
+        interstate_geoms = []
+        for record, geometry in zip(reader.records(), reader.geometries()):
+            attrs = record.attributes if hasattr(record, 'attributes') else record.__dict__
+            is_interstate = False
+            for key in ('RTTYP', 'RTE_TYPE', 'MTFCC'):
+                if key in attrs and str(attrs.get(key)).upper() == 'I': is_interstate = True
+            if not is_interstate and 'FULLNAME' in attrs and 'INTERSTATE' in str(attrs.get('FULLNAME')).upper():
+                is_interstate = True
+            if is_interstate: interstate_geoms.append(geometry)
+        if interstate_geoms:
+            ax.add_geometries(interstate_geoms, ccrs.PlateCarree(), edgecolor='#D14900', 
+                              facecolor='none', linewidth=1.2, zorder=3.5, alpha=0.9)
+    except Exception as e: pass
+
+def draw_major_cities(ax):
+    cities = {
+        'Seattle': (-122.33, 47.60), 'Los Angeles': (-118.24, 34.05),
+        'Denver': (-104.99, 39.73), 'Chicago': (-87.62, 41.87),
+        'New York': (-74.00, 40.71), 'Houston': (-95.36, 29.76),
+        'Miami': (-80.19, 25.76), 'Atlanta': (-84.38, 33.74),
+        'Cartersville': (-84.80, 34.16)
+    }
+    for name, (lon, lat) in cities.items():
+        ax.plot(lon, lat, marker='o', color='white', markeredgecolor='black', markersize=5, transform=ccrs.PlateCarree(), zorder=5)
+        ax.text(lon + 0.5, lat + 0.5, name, color='white', fontsize=11, fontweight='bold',
+                path_effects=TEXT_OUTLINE, transform=ccrs.PlateCarree(), zorder=6)
+
+def draw_isobars(ax, grid_x, grid_y, grid_p, levels, fmt='%d mb'):
+    cs = ax.contour(grid_x, grid_y, grid_p, levels=levels, 
+                    colors='white', linewidths=1.8, zorder=2.0, transform=ccrs.PlateCarree())
+    cs.set_path_effects([pe.Stroke(linewidth=3.5, foreground='black'), pe.Normal()])
+    clabels = ax.clabel(cs, fmt=fmt, inline=True, inline_spacing=12, fontsize=10, colors='white')
+    for label in clabels:
+        label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
+        label.set_fontweight('bold')
+    return cs
+
+def add_clean_colorbar(fig, ax, cf, label):
+    if cf is not None:
+        cax = fig.add_axes([0.06, 0.08, 0.88, 0.025])
+        cb = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both', extendfrac=0.04)
+        
+        cb.set_label(label, fontsize=13, fontweight='bold', color='white', labelpad=10)
+        cb.ax.xaxis.label.set_path_effects(TEXT_OUTLINE)
+        
+        if 'Temperature' in label or 'Dewpoint' in label: ticks = np.arange(-40, 131, 10)
+        elif 'Relative Humidity' in label: ticks = np.arange(10, 101, 10)
+        elif 'Wind Speed' in label: ticks = np.arange(20, 201, 20)
+        elif 'Advection' in label or 'Vorticity' in label or 'Divergence' in label: ticks = np.arange(-20, 21, 5)
+        else: ticks = cb.get_ticks()
+        
+        vmin, vmax = cf.get_clim()
+        valid_ticks = [t for t in ticks if vmin <= t <= vmax]
+        
+        cb.set_ticks(valid_ticks)
+        cb.ax.tick_params(axis='x', length=0, colors='white')
+        
+        cb.ax.set_xticklabels([str(int(t)) for t in valid_ticks], fontsize=11, fontweight='bold', color='white')
+        
+        for tick_label in cb.ax.get_xticklabels():
+            tick_label.set_path_effects(TEXT_OUTLINE)
+
+
+# ====================================================================
+# 6. CORE GENERATION PLOTS 
 # ====================================================================
 
 def generate_mslp_temp_map():
@@ -806,20 +782,10 @@ def generate_mslp_temp_map():
     rtma_data = fetch_rtma_sfc(EXTENT)
     ncom_lat, ncom_lon, ncom_temp_k, ncom_u, ncom_v, ncom_sal = fetch_ocean_currents(EXTENT)
     
-    # Heuristic: determine which source likely provided the data for logging
-    try:
-        if ncom_u is not None and np.any(np.isfinite(ncom_u)):
-            _marine_source = 'RTOFS (currents present)'
-        else:
-            _marine_source = 'IEM mesonet (station-gridded)'
-    except Exception:
-        _marine_source = 'unknown'
-    print(f"Marine currents source: {_marine_source}")
-    
     grid_y, grid_x, g_temp, g_u, g_v, g_p = blend_surface_models(rap_data, hrrr_data, rtma_data, EXTENT)
 
     fig = plt.figure(figsize=(18, 11), facecolor=FIG_BG_COLOR)
-    ax = fig.add_axes([0.06, 0.16, 0.88, 0.75], projection=ccrs.PlateCarree())
+    ax = fig.add_axes([0.08, 0.16, 0.86, 0.75], projection=ccrs.PlateCarree())
     ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
     
     ax.add_feature(cfeature.OCEAN, facecolor=OCEAN_COLOR, zorder=0)
@@ -828,11 +794,9 @@ def generate_mslp_temp_map():
     ax.add_feature(cfeature.BORDERS, edgecolor='black', linestyle=':', linewidth=1.4, zorder=3)
     ax.add_feature(cfeature.STATES, edgecolor='black', linestyle=':', linewidth=0.9, zorder=3)
     
-    # Axis Gridline Styling
     gl = ax.gridlines(draw_labels=True, linewidth=1.0, color=GRIDLINE_COLOR, alpha=0.4, linestyle='--')
     gl.top_labels = False; gl.right_labels = False
-    gl.xlabel_style = LABEL_STYLE
-    gl.ylabel_style = LABEL_STYLE
+    gl.xlabel_style = LABEL_STYLE; gl.ylabel_style = LABEL_STYLE
 
     cf_temp = None
     if g_temp is not None:
@@ -842,51 +806,49 @@ def generate_mslp_temp_map():
                               norm=mcolors.Normalize(vmin=-40.0, vmax=120.0), 
                               transform=ccrs.PlateCarree(), extend='both', alpha=0.85, zorder=1.5)
 
-    # === PLOT MARINE OCEAN CURRENTS ===
-    if (ncom_lat is not None and 
-        ncom_u is not None and 
-        np.any(np.isfinite(ncom_u))):   # ← only plot if we actually have valid ocean data
-        print("• Plotting Marine/Ocean Layer (Dynamic/Outlined)...", end=" ", flush=True)
+    if (ncom_lat is not None and ncom_u is not None and np.any(np.isfinite(ncom_u))):
+        print("• Plotting Marine/Ocean Layer...", end=" ", flush=True)
         try:
-            # NO MESHGRID: Use raw RTOFS 2D arrays directly
             nc_x, nc_y = ncom_lon, ncom_lat
             marine_vort, _, _ = calc_marine_physics(ncom_temp_k, ncom_u, ncom_v, 70, 60, 10)
 
-            # 1. Vorticity contours
             ax.contour(nc_x, nc_y, marine_vort, levels=[-0.0001, -0.00005, 0.00005, 0.0001],
                        colors=['blue', 'cyan', 'orange', 'red'], linewidths=1.2,
                        alpha=0.6, transform=ccrs.PlateCarree(), zorder=1.56)
 
-            # 2. Dynamic Streamplot (now cleanly stops at coastlines)
+            # Convert ocean current temp data matrix from Kelvin to Celsius
+            ncom_temp_c = ncom_temp_k - 273.15
+
             stride = 6
             strm = ax.streamplot(nc_x[::stride, ::stride], nc_y[::stride, ::stride], 
                                  ncom_u[::stride, ::stride], ncom_v[::stride, ::stride], 
-                                 color=ncom_temp_k[::stride, ::stride], cmap='plasma',
+                                 color=ncom_temp_c[::stride, ::stride], cmap='jet',
                                  density=1.2, linewidth=1.5, arrowsize=1.5,
                                  transform=ccrs.PlateCarree(), zorder=2.0)
             
-            # Isobar-style outline
             strm.lines.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
             
             # Dedicated colorbar for ocean temperature
-            cax_marine = fig.add_axes([0.02, 0.2, 0.015, 0.5])
-            cbar = fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (K)', extend='both')
+            # Shifted slightly right to 0.02 to allow space for the left-side text labels
+            cax_marine = fig.add_axes([0.02, 0.16, 0.010, 0.75]) 
+            cbar = fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (°C)', extend='both')
+            
+            # === FLIP TEXT AND TICKS TO THE LEFT SIDE ===
+            cbar.ax.yaxis.set_label_position('left')
+            cbar.ax.yaxis.set_ticks_position('left')
             
             # Match the styling to your main colorbar
-            cbar.set_label('Ocean Temp (K)', fontsize=11, fontweight='bold', color='white')
+            cbar.set_label('Ocean Temp (°C)', fontsize=11, fontweight='bold', color='white')
             cbar.ax.yaxis.label.set_path_effects(TEXT_OUTLINE)
-            cbar.ax.tick_params(axis='y', colors='white')
+            cbar.ax.tick_params(axis='y', colors='white', pad=6) # Small pad to prevent text-to-bar touching
             
             for tick_label in cbar.ax.get_yticklabels():
                 tick_label.set_path_effects(TEXT_OUTLINE)
                 tick_label.set_fontweight('bold')
-            
             print("Done. ✅")
         except Exception as e:
-            print(f"Marine Error: {e} ❌")
             logging.error(f"Marine Plotting Error: {e}")
 
-    # === PLOT ISOBARS & BARBS ===
     if g_p is not None:
         draw_isobars(ax, grid_x, grid_y, g_p, np.arange(950, 1050, 2), fmt='%d mb')
         
@@ -914,52 +876,20 @@ def generate_mslp_temp_map():
     buf.seek(0)
     return buf, run_date
 
-def generate_upper_air_map(ds, run_date, level, variable, cmap, title, cb_label, levels=None):
+def generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level, variable, cmap, title, cb_label, levels=None):
     try:
-        time_dims = get_dynamic_time_dims(ds)
-        ds = ds.isel(**time_dims)
+        # Pre-compute Physics from Blended Array Grids
+        heights_dam = hgt / 10.0
         
-        lat_var = next((v for v in ds.variables if 'lat' in v.lower() and 'isobaric' not in v.lower()), None)
-        lon_var = next((v for v in ds.variables if 'lon' in v.lower() and 'isobaric' not in v.lower()), None)
-        
-        if not lat_var or not lon_var:
-            logging.error("Valid Lat/Lon arrays not found in dataset.")
-            return None
-
-        lat_2d = ds[lat_var].values
-        lon_2d = ds[lon_var].values
-        
-        if lon_2d.ndim == 1:
-            lon_2d, lat_2d = np.meshgrid(lon_2d, lat_2d)
-            
-        lon_2d = np.where(lon_2d > 180, lon_2d - 360, lon_2d)
-
-        iso_dim = next((d for d in ds.dims if 'isobaric' in d.lower()), 'isobaric')
-        
-        heights_m = ds['Geopotential_height_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-        heights_dam = ndimage.gaussian_filter(heights_m, sigma=3, order=0) / 10.0
-
-        u_wind = ds['u-component_of_wind_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-        v_wind = ds['v-component_of_wind_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-
-        if variable == 'wind_speed': data = compute_wind_speed(u_wind, v_wind)
-        elif variable == 'vorticity': data = compute_vorticity(u_wind, v_wind, lat_2d, lon_2d)
-        elif variable == 'relative_humidity': data = ds['Relative_humidity_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-        elif variable == 'temp_advection':
-            temp = ds['Temperature_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-            data = compute_advection(temp, u_wind, v_wind, lat_2d, lon_2d) * 3600
-        elif variable == 'moisture_advection':
-            rh = ds['Relative_humidity_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-            data = compute_advection(rh, u_wind, v_wind, lat_2d, lon_2d) * 1e4
-        elif variable == 'dewpoint':
-            temp = ds['Temperature_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-            rh = ds['Relative_humidity_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-            data = compute_dewpoint(temp, rh)
-        elif variable == 'divergence': data = compute_divergence(u_wind, v_wind, lat_2d, lon_2d)
-        elif variable == 'frontogenesis':
-            temp_k = ds['Temperature_isobaric'].sel({iso_dim: level}, method='nearest').squeeze().values.copy()
-            temp = temp_k - 273.15
-            data = frontogenesis_700hPa(temp, u_wind, v_wind, lat_2d, lon_2d)
+        if variable == 'wind_speed': data = compute_wind_speed(u, v)
+        elif variable == 'vorticity': data = compute_vorticity(u, v, grid_y, grid_x)
+        elif variable == 'relative_humidity': data = rh
+        elif variable == 'temp_advection': data = compute_advection(temp, u, v, grid_y, grid_x) * 3600
+        elif variable == 'moisture_advection': data = compute_advection(rh, u, v, grid_y, grid_x) * 1e4
+        elif variable == 'dewpoint': data = compute_dewpoint(temp, rh)
+        elif variable == 'divergence': data = compute_divergence(u, v, grid_y, grid_x)
+        elif variable == 'frontogenesis': data = frontogenesis_700hPa(temp - 273.15, u, v, grid_y, grid_x)
+        else: data = np.zeros_like(grid_x)
 
         fig = plt.figure(figsize=(18, 11), facecolor=FIG_BG_COLOR)
         ax = fig.add_axes([0.06, 0.16, 0.88, 0.75], projection=ccrs.PlateCarree())
@@ -971,19 +901,17 @@ def generate_upper_air_map(ds, run_date, level, variable, cmap, title, cb_label,
         ax.add_feature(cfeature.BORDERS, edgecolor='black', linestyle=':', linewidth=1.4, zorder=3)
         ax.add_feature(cfeature.STATES, edgecolor='black', linestyle=':', linewidth=0.9, zorder=3)
         
-        # Axis Gridline Styling (Requested: Outlines for Lat/Lon)
         gl = ax.gridlines(draw_labels=True, linewidth=1.0, color=GRIDLINE_COLOR, alpha=0.4, linestyle='--')
         gl.top_labels = False; gl.right_labels = False
-        gl.xlabel_style = LABEL_STYLE
-        gl.ylabel_style = LABEL_STYLE
+        gl.xlabel_style = LABEL_STYLE; gl.ylabel_style = LABEL_STYLE
 
         draw_interstates_from_shapefile(ax)
         draw_major_cities(ax)
 
         if levels is None:
-            cf = ax.contourf(lon_2d, lat_2d, data, cmap=cmap, transform=ccrs.PlateCarree(), extend='both', alpha=0.85)
+            cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), extend='both', alpha=0.85)
         else:
-            cf = ax.contourf(lon_2d, lat_2d, data, cmap=cmap, transform=ccrs.PlateCarree(), levels=levels, extend='both', alpha=0.85)
+            cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), levels=levels, extend='both', alpha=0.85)
 
         if level == 30000: h_levels = np.arange(800, 1040, 4) 
         elif level == 50000: h_levels = np.arange(480, 620, 4)
@@ -992,11 +920,11 @@ def generate_upper_air_map(ds, run_date, level, variable, cmap, title, cb_label,
         else: h_levels = None
 
         if h_levels is not None:
-            draw_isobars(ax, lon_2d, lat_2d, heights_dam, h_levels, fmt='%i dam')
+            draw_isobars(ax, grid_x, grid_y, heights_dam, h_levels, fmt='%i dam')
 
         skip = 24
-        u_wind_knots, v_wind_knots = u_wind * 1.94384, v_wind * 1.94384
-        ax.barbs(lon_2d[::skip, ::skip], lat_2d[::skip, ::skip], u_wind_knots[::skip, ::skip], v_wind_knots[::skip, ::skip], 
+        u_wind_knots, v_wind_knots = u * 1.94384, v * 1.94384
+        ax.barbs(grid_x[::skip, ::skip], grid_y[::skip, ::skip], u_wind_knots[::skip, ::skip], v_wind_knots[::skip, ::skip], 
                  transform=ccrs.PlateCarree(), length=6, color='black', zorder=4)
 
         ax.set_title(f"{title}", fontsize=20, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, loc='left', pad=15)
@@ -1014,88 +942,55 @@ def generate_upper_air_map(ds, run_date, level, variable, cmap, title, cb_label,
         return None
 
 # ====================================================================
-# 6. EXPLICIT CONTOUR LEVELS & RUNNERS
+# 7. UNIFIED PIPELINE RUNNERS
 # ====================================================================
 
-def run_wind300():
-    ds, run_date = get_rap_data_for_level(30000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 30000, 'wind_speed', 'cool', 'RAP 13km: 300-hPa Wind Speeds and Heights', 'Wind Speed (knots)', levels=np.arange(20, 201, 10))
+def run_upper_air_pipeline(level, variable, cmap, title, cb_label, levels=None):
+    """Centralized pipeline to Fetch, Blend, and Generate Upper Air Maps."""
+    run_date = datetime.now(timezone.utc)
+    rap = fetch_upper_air_model('RAP', level)
+    gfs = fetch_upper_air_model('GFS', level)
+    
+    grid_x, grid_y, hgt, u, v, temp, rh = blend_upper_air_models([rap, gfs], EXTENT)
+    
+    if grid_x is not None:
+        buf = generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level, variable, cmap, title, cb_label, levels)
         if buf:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'wind300_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+            filename = f"{variable}_{int(level/100)}mb_{run_date.strftime('%Y%m%d_%H%MZ')}.png"
+            with open(os.path.join(OUTPUT_DIR, filename), 'wb') as f: 
+                f.write(buf.getbuffer())
+            logging.info(f"✅ Generated {filename}")
+
+def run_wind300():
+    run_upper_air_pipeline(30000, 'wind_speed', 'cool', 'Blended RAP/GFS: 300-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 201, 10))
 
 def run_wind500():
-    ds, run_date = get_rap_data_for_level(50000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 50000, 'wind_speed', 'YlOrBr', 'RAP 13km: 500-hPa Wind Speeds and Heights', 'Wind Speed (knots)', levels=np.arange(20, 181, 10))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'wind500_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(50000, 'wind_speed', 'YlOrBr', 'Blended RAP/GFS: 500-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 181, 10))
 
 def run_vort500():
-    ds, run_date = get_rap_data_for_level(50000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 50000, 'vorticity', 'seismic', 'RAP 13km: 500-hPa Relative Vorticity and Heights', 'Vorticity ($10^{-5}$ s$^{-1}$)', levels=np.linspace(-20, 20, 41))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'vort500_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(50000, 'vorticity', 'seismic', 'Blended RAP/GFS: 500-hPa Relative Vorticity and Heights', 'Vorticity ($10^{-5}$ s$^{-1}$)', np.linspace(-20, 20, 41))
 
 def run_rh700():
-    ds, run_date = get_rap_data_for_level(70000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 70000, 'relative_humidity', 'BuGn', 'RAP 13km: 700-hPa Relative Humidity and Heights', 'Relative Humidity (%)', levels=np.arange(10, 101, 5))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'rh700_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(70000, 'relative_humidity', 'BuGn', 'Blended RAP/GFS: 700-hPa Relative Humidity and Heights', 'Relative Humidity (%)', np.arange(10, 101, 5))
 
 def run_fronto700():
-    ds, run_date = get_rap_data_for_level(70000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 70000, 'frontogenesis', 'RdBu_r', 'RAP 13km: 700-hPa Frontogenesis and Heights', 'Frontogenesis (K/100km/3hr)', levels=np.linspace(-10, 10, 41))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'fronto700_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(70000, 'frontogenesis', 'RdBu_r', 'Blended RAP/GFS: 700-hPa Frontogenesis and Heights', 'Frontogenesis (K/100km/3hr)', np.linspace(-10, 10, 41))
 
 def run_wind850():
-    ds, run_date = get_rap_data_for_level(85000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 85000, 'wind_speed', 'YlOrBr', 'RAP 13km: 850-hPa Wind Speeds and Heights', 'Wind Speed (knots)', levels=np.arange(20, 141, 10))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'wind850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(85000, 'wind_speed', 'YlOrBr', 'Blended RAP/GFS: 850-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 141, 10))
 
 def run_dew850():
-    ds, run_date = get_rap_data_for_level(85000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 85000, 'dewpoint', 'BuGn', 'RAP 13km: 850-hPa Dewpoint and Heights', 'Dewpoint (°C)', levels=np.arange(-40, 31, 2))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'dew850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(85000, 'dewpoint', 'BuGn', 'Blended RAP/GFS: 850-hPa Dewpoint and Heights', 'Dewpoint (°C)', np.arange(-40, 31, 2))
 
 def run_mAdv850():
-    ds, run_date = get_rap_data_for_level(85000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 85000, 'moisture_advection', 'PRGn', 'RAP 13km: 850-hPa Moisture Advection and Heights', 'Moisture Advection (%/hour)', levels=np.linspace(-20, 20, 41))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'mAdv850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(85000, 'moisture_advection', 'PRGn', 'Blended RAP/GFS: 850-hPa Moisture Advection and Heights', 'Moisture Advection (%/hour)', np.linspace(-20, 20, 41))
 
 def run_tAdv850():
-    ds, run_date = get_rap_data_for_level(85000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 85000, 'temp_advection', 'coolwarm', 'RAP 13km: 850-hPa Temperature Advection and Heights', 'Temperature Advection (K/hour)', levels=np.linspace(-20, 20, 41))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'tAdv850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(85000, 'temp_advection', 'coolwarm', 'Blended RAP/GFS: 850-hPa Temperature Advection and Heights', 'Temperature Advection (K/hour)', np.linspace(-20, 20, 41))
 
 def run_divcon300():
-    ds, run_date = get_rap_data_for_level(30000)
-    if ds:
-        buf = generate_upper_air_map(ds, run_date, 30000, 'divergence', 'RdBu_r', 'RAP 13km: 300-hPa Divergence and Heights', 'Divergence ($10^{-5}$ s$^{-1}$)', levels=np.linspace(-15, 15, 31))
-        if buf:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            with open(os.path.join(OUTPUT_DIR, f'divcon300_{run_date.strftime("%Y%m%d_%H%MZ")}.png'), 'wb') as f: f.write(buf.getbuffer())
+    run_upper_air_pipeline(30000, 'divergence', 'RdBu_r', 'Blended RAP/GFS: 300-hPa Divergence and Heights', 'Divergence ($10^{-5}$ s$^{-1}$)', np.linspace(-15, 15, 31))
 
 def run_mslp():
     generate_mslp_temp_map()
