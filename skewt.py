@@ -13,6 +13,7 @@ import sharppy.sharptab.profile as profile
 import sharppy.sharptab.params as params
 import sharppy.sharptab.winds as winds
 import sharppy.sharptab.interp as interp
+from metpy.units import units
 
 # --- APPLYING FROSTBYTE THEME GLOBALS ---
 plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -69,7 +70,17 @@ STATIONS = {
     'SFO': (37.62, -122.37), 'STL': (38.75, -90.37),  'TPA': (27.98, -82.53),
     'TVC': (44.74, -85.58),  'IAD': (38.94, -77.46),  'GPT': (30.41, -89.07),
     'VQQ': (30.22, -81.88),  'TIH': (-31.94, 115.97), 'FNY': (55.75, 37.62),
-    'INL': (48.56, -93.40)
+    'INL': (48.56, -93.40),
+    
+    # --- Added Midwest / Core SPC Sounding Additions ---
+    'GRB': (44.48, -88.13),  'DVN': (41.61, -90.58),  'ILX': (40.15, -89.34),
+    'TOP': (39.07, -95.63),  'SGF': (37.23, -93.39),  'LZK': (34.84, -92.26),
+    'OAX': (41.32, -96.37),  'MPX': (44.85, -93.56),  'DDC': (37.76, -100.02),
+    'AMA': (35.22, -101.71), 'FWD': (32.82, -97.30),  'JAN': (32.31, -90.08),
+    'BNA': (36.12, -86.68),  'GSO': (36.08, -79.95),  'ILN': (39.43, -83.81),
+    'LBF': (41.13, -100.68), 'ABR': (45.45, -98.42),  'BIS': (46.77, -100.75),
+    'RAP': (44.05, -103.21), 'EET': (33.17, -86.77),  'CHS': (32.90, -80.04),
+    'TLH': (30.39, -84.35),  'JAX': (30.49, -81.69)
 }
 
 # Mapping to NWS station IDs with working BUFKIT links
@@ -80,7 +91,14 @@ NWS_STATIONS = {
     'ASH': 'KASH', 'JFK': 'KJFK', 'PDX': 'KPDX', 'PHL': 'KPHL', 'PIT': 'KPIT',
     'SAN': 'KSAN', 'SFO': 'KSFO', 'STL': 'KSTL', 'TPA': 'KTPA', 'TVC': 'KTVC',
     'IAD': 'KIAD', 'GPT': 'KGPT', 'VQQ': 'KCRG', 'TIH': 'XTIH', 'FNY': 'XFNY',
-    'INL': 'KINL'
+    'INL': 'KINL',
+    
+    # --- Added Midwest / Core SPC Sounding Additions ---
+    'GRB': 'KGRB', 'DVN': 'KDVN', 'ILX': 'KILX', 'TOP': 'KTOP', 'SGF': 'KSGF',
+    'LZK': 'KLZK', 'OAX': 'KOAX', 'MPX': 'KMPX', 'DDC': 'KDDC', 'AMA': 'KAMA',
+    'FWD': 'KFWD', 'JAN': 'KJAN', 'BNA': 'KBNA', 'GSO': 'KGSO', 'ILN': 'KILN',
+    'LBF': 'KLBF', 'ABR': 'KABR', 'BIS': 'KBIS', 'RAP': 'KRAP', 'EET': 'KBMX',
+    'CHS': 'KCHS', 'TLH': 'KTLH', 'JAX': 'KJAX'
 }
 
 OUTPUT_DIR = os.path.join(os.getcwd(), 'output')
@@ -565,6 +583,10 @@ async def generate_skewt_plot(args):
         # 4. Pull the exact SPC Effective Inflow Layer bounds
         spc_eil_pbot, spc_eil_ptop = params.effective_inflow_layer(prof_spc)
         
+        # Sanitize SHARPpy's MaskedConstants into plain None so fallback logic triggers correctly
+        if np.ma.is_masked(spc_eil_pbot) or np.ma.is_masked(spc_eil_ptop):
+            spc_eil_pbot, spc_eil_ptop = None, None
+        
         # 5. Get true Bunkers Storm Motion
         srwind = params.bunkers_storm_motion(prof_spc)
         rstu, rstv = srwind[0], srwind[1]  # Cleanly separate the Right Mover U and V components
@@ -640,13 +662,25 @@ async def generate_skewt_plot(args):
         # Kinematics
         RM, LM, MW = mpcalc.bunkers_storm_motion(p, u, v, z)
         
-        # Override MetPy's Right Mover with SHARPpy's True Bunkers 2014 RM
-        if 'rstu' in locals() and not np.isnan(rstu):
-            RM = [rstu * 0.514444 * units('m/s'), rstv * 0.514444 * units('m/s')]
-            
-        storm_u = RM[0]
-        storm_v = RM[1]
-        
+        # --- Build storm motion directly from the most reliable source ---
+        try:
+            # Safely extract plain floats. Explicitly check for masks and SHARPpy's missing flag (-9999.0)
+            if 'rstu' in locals() and not np.ma.is_masked(rstu) and float(rstu) != -9999.0 and not np.isnan(float(rstu)):
+                su_val = float(rstu) * 0.514444
+                sv_val = float(rstv) * 0.514444
+            elif RM[0] is not None and not np.ma.is_masked(RM[0]):
+                su_val = float(RM[0].to('m/s').magnitude)
+                sv_val = float(RM[1].to('m/s').magnitude)
+            else:
+                su_val, sv_val = 0.0, 0.0
+        except Exception:
+            su_val, sv_val = 0.0, 0.0
+
+        # Force brand-new quantities from raw floats. MetPy cannot reject this.
+        # This completely prevents MaskedConstants from infecting the downstream Slinky/Hodograph math.
+        storm_u = units.Quantity(su_val, 'm/s')
+        storm_v = units.Quantity(sv_val, 'm/s')
+
         total_helicity1, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=1 * units.km, storm_u=storm_u, storm_v=storm_v)
         total_helicity3, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=3 * units.km, storm_u=storm_u, storm_v=storm_v)
         total_helicity6, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=6 * units.km, storm_u=storm_u, storm_v=storm_v)
@@ -923,7 +957,7 @@ async def generate_skewt_plot(args):
                 eil_ptop = p[idx_3km]
 
         # Draw the purple I-bar + labels
-        if eil_pbot is not None and eil_ptop is not None and not np.isnan(eil_pbot.magnitude):
+        if eil_pbot is not None and eil_ptop is not None and hasattr(eil_pbot, 'magnitude') and not np.isnan(eil_pbot.magnitude):
             try:
                 eil_zbot = np.interp(eil_pbot.magnitude, p.magnitude[::-1], z.magnitude[::-1]) * units.m
                 eil_ztop = np.interp(eil_ptop.magnitude, p.magnitude[::-1], z.magnitude[::-1]) * units.m
@@ -951,6 +985,24 @@ async def generate_skewt_plot(args):
             except Exception as e:
                 logger.error(f"EIL bar error: {e}")
         # ====================== END EIL BAR ======================
+
+        # ====================== 700-500 hPa LAPSE RATE BRACKET ======================
+        if 'lr_700_500_val' in locals() and not np.isnan(lr_700_500_val):
+            try:
+                # Use a blended transform: X is a percentage of plot width (0.12), Y is data (hPa)
+                trans_lr = mtransforms.blended_transform_factory(skew.ax.transAxes, skew.ax.transData)
+                x_pos = 0.12 # 12% from the left edge, safely away from the EIL bar
+                
+                # Draw the vertical line and horizontal ticks
+                skew.ax.plot([x_pos, x_pos], [700, 500], color='red', linewidth=2, transform=trans_lr, zorder=10)
+                skew.ax.plot([x_pos - 0.015, x_pos + 0.015], [700, 700], color='red', linewidth=2, transform=trans_lr, zorder=10)
+                skew.ax.plot([x_pos - 0.015, x_pos + 0.015], [500, 500], color='red', linewidth=2, transform=trans_lr, zorder=10)
+                
+                # Add the text label right above the 500 hPa tick
+                skew.ax.text(x_pos, 480, f"{lr_700_500_val:.1f} °C/km", color='red', fontsize=11, ha='center', va='bottom', transform=trans_lr, path_effects=text_outline, zorder=10)
+            except Exception as e:
+                logger.error(f"Lapse rate bar error: {e}")
+        # ============================================================================
 
         def plot_point(skew, pressure, temperature, marker, color, label):
             cond1 = pressure is not None
@@ -1095,52 +1147,100 @@ async def generate_skewt_plot(args):
         h.ax.scatter(u[idx_6km], v[idx_6km], color='cyan', marker='x', s=100, label='6 km Wind', zorder=4)
         h.ax.text(u[idx_6km].magnitude + 2, v[idx_6km].magnitude + 2, '6 km', color='cyan', fontsize=10, path_effects=text_outline)
         
-        h.ax.scatter(RM[0].magnitude, RM[1].magnitude, color='none', edgecolor='red', marker='o', s=150, linewidths=2, zorder=6)
-        h.ax.scatter(RM[0].magnitude, RM[1].magnitude, color='red', marker='+', s=100, linewidths=2, zorder=6)
+        # ====================================================================
+        # --- SHARPPY HODOGRAPH KINEMATICS (BUNKERS, CORFIDI, MEAN WIND) ---
+        # ====================================================================
         
-        h.ax.scatter(LM[0].magnitude, LM[1].magnitude, color='white', edgecolor='blue', marker='o', s=100, zorder=6)
-        h.ax.scatter(MW[0].magnitude, MW[1].magnitude, color='white', edgecolor='black', marker='s', s=80, zorder=6)
+        # Override MetPy points with true SHARPpy Bunkers points
+        rm_kts = params.bunkers_storm_motion(prof_spc)
 
-        # Get true storm motion vectors in knots for the labels
-        # (params.bunkers_storm_motion returns knots)
-        rm_kts = params.bunkers_storm_motion(prof_spc) 
+        # Helper to safely extract a float from SHARPpy's output
+        def safe_float(val, multiplier=1.0):
+            try:
+                if np.ma.is_masked(val) or float(val) == -9999.0 or np.isnan(float(val)):
+                    return np.nan
+                return float(val) * multiplier
+            except Exception:
+                return np.nan
+
+        rm_u_shp = safe_float(rm_kts[0], 0.514444)
+        rm_v_shp = safe_float(rm_kts[1], 0.514444)
+        lm_u_shp = safe_float(rm_kts[2], 0.514444)
+        lm_v_shp = safe_float(rm_kts[3], 0.514444)
         
-        # Helper to convert to speed/angle
-        def get_speed_dir(u_knots, v_knots):
-            speed = np.sqrt(u_knots**2 + v_knots**2)
-            direction = (np.degrees(np.arctan2(u_knots, v_knots)) + 180) % 360
-            return speed, direction
+        if not np.isnan(rm_u_shp) and not np.isnan(rm_v_shp):
+            h.ax.scatter(rm_u_shp, rm_v_shp, color='none', edgecolor='red', marker='o', s=150, linewidths=2, zorder=6, label='Bunkers RM')
+            h.ax.scatter(rm_u_shp, rm_v_shp, color='red', marker='+', s=100, linewidths=2, zorder=6)
+            
+        if not np.isnan(lm_u_shp) and not np.isnan(lm_v_shp):
+            h.ax.scatter(lm_u_shp, lm_v_shp, color='white', edgecolor='#00BFFF', marker='o', s=100, zorder=6, label='Bunkers LM')
 
-        rm_spd, rm_dir = get_speed_dir(rm_kts[0], rm_kts[1])
-        lm_spd, lm_dir = get_speed_dir(rm_kts[2], rm_kts[3])
+        # MW (Mean Wind) from SHARPpy
+        try:
+            mw_raw_u, mw_raw_v = winds.mean_wind(prof_spc, pbot=600, ptop=100)
+            mw_u, mw_v = safe_float(mw_raw_u, 0.514444), safe_float(mw_raw_v, 0.514444)
+            if not np.isnan(mw_u) and not np.isnan(mw_v):
+                h.ax.scatter(mw_u, mw_v, color='white', edgecolor='black', marker='s', s=80, zorder=6, label='Mean Wind')
+        except Exception:
+            mw_u, mw_v = np.nan, np.nan
 
-        motions = [
-            (RM, f'RM\n{rm_dir:.0f}°/{rm_spd:.0f}kt', (2, -2)), 
-            (LM, f'LM\n{lm_dir:.0f}°/{lm_spd:.0f}kt', (2, -2)), 
-            (MW, 'MW', (2, -2))
-        ]
-        
-        for motion, label, offset in motions:
-            h.ax.text(
-                motion[0].magnitude + offset[0], 
-                motion[1].magnitude + offset[1], 
-                label, 
-                weight='bold', ha='left', fontsize=11, alpha=0.9, path_effects=text_outline, color='white'
-            )
+        # UP and DP (True SHARPpy Corfidi Vectors)
+        try:
+            # SHARPpy calculates both Corfidi vectors in a single function call
+            # Returns: (up_u, up_v, dn_u, dn_v)
+            corfidi_kts = winds.corfidi_mcs_motion(prof_spc)
+            
+            up_u_shp, up_v_shp = safe_float(corfidi_kts[0], 0.514444), safe_float(corfidi_kts[1], 0.514444)
+            dp_u_shp, dp_v_shp = safe_float(corfidi_kts[2], 0.514444), safe_float(corfidi_kts[3], 0.514444)
+            
+            if not np.isnan(up_u_shp) and not np.isnan(up_v_shp):
+                h.ax.scatter(up_u_shp, up_v_shp, color='none', edgecolor='#00BFFF', marker='o', s=60, linewidths=1.5, zorder=7, label='Corfidi UP')
+            
+            if not np.isnan(dp_u_shp) and not np.isnan(dp_v_shp):
+                h.ax.scatter(dp_u_shp, dp_v_shp, color='none', edgecolor='#00BFFF', marker='o', s=60, linewidths=1.5, zorder=7, label='Corfidi DP')
+        except Exception as e:
+            logger.error(f"Corfidi plotting error: {e}")
+            corfidi_kts = [np.nan, np.nan, np.nan, np.nan] # Prevent label block from crashing
+            up_u_shp, up_v_shp, dp_u_shp, dp_v_shp = np.nan, np.nan, np.nan, np.nan
+
+        # Helper with safe formatting for missing data (Strips strings to mimic SHARPpy)
+        def get_speed_dir_str(u_knots, v_knots):
+            if np.ma.is_masked(u_knots) or np.ma.is_masked(v_knots) or np.isnan(float(u_knots)):
+                return "---", "---"
+            u_f, v_f = float(u_knots), float(v_knots)
+            speed = np.sqrt(u_f**2 + v_f**2)
+            direction = (np.degrees(np.arctan2(u_f, v_f)) + 180) % 360
+            return f"{direction:.0f}", f"{speed:.0f}"
+
+        # Draw the labels natively in exact SHARPpy format (e.g. "230/15 RM")
+        if not np.isnan(rm_u_shp) and not np.isnan(rm_v_shp):
+            rm_dir_str, rm_spd_str = get_speed_dir_str(rm_kts[0], rm_kts[1])
+            h.ax.text(rm_u_shp + 2, rm_v_shp - 2.5, f'{rm_dir_str}/{rm_spd_str} RM', weight='bold', ha='left', va='top', fontsize=10, path_effects=text_outline, color='white')
+            
+        if not np.isnan(lm_u_shp) and not np.isnan(lm_v_shp):
+            lm_dir_str, lm_spd_str = get_speed_dir_str(rm_kts[2], rm_kts[3])
+            h.ax.text(lm_u_shp + 2, lm_v_shp - 2.5, f'{lm_dir_str}/{lm_spd_str} LM', weight='bold', ha='left', va='top', fontsize=10, path_effects=text_outline, color='white')
+            
+        if not np.isnan(mw_u) and not np.isnan(mw_v):
+            h.ax.text(mw_u + 2, mw_v - 2.5, 'MW', weight='bold', ha='left', va='top', fontsize=10, path_effects=text_outline, color='white')
+
+        if not np.isnan(up_u_shp) and not np.isnan(up_v_shp):
+            up_dir, up_spd = get_speed_dir_str(corfidi_kts[0], corfidi_kts[1])
+            h.ax.text(up_u_shp, up_v_shp - 2.5, f'UP={up_dir}/{up_spd}', color='#00BFFF', fontsize=9, fontweight='bold', path_effects=text_outline, ha='center', va='top')
+
+        if not np.isnan(dp_u_shp) and not np.isnan(dp_v_shp):
+            dp_dir, dp_spd = get_speed_dir_str(corfidi_kts[2], corfidi_kts[3])
+            h.ax.text(dp_u_shp, dp_v_shp - 2.5, f'DP={dp_dir}/{dp_spd}', color='#00BFFF', fontsize=9, fontweight='bold', path_effects=text_outline, ha='center', va='top')
 
         # --- HODOGRAPH KINEMATIC LINES ---
-        # 1. Storm Split (RM to LM)
-        h.ax.plot([RM[0].magnitude, LM[0].magnitude], [RM[1].magnitude, LM[1].magnitude], 
-                  color='purple', linewidth=2, linestyle='-', zorder=5)
+        # 1. Inflow Vector (RM to Surface) - The "White Dotted" line
+        if not np.isnan(rm_u_shp) and not np.isnan(rm_v_shp):
+            h.ax.plot([rm_u_shp, u[0].magnitude], [rm_v_shp, v[0].magnitude], 
+                      color='white', linewidth=2, linestyle=':', zorder=4)
 
-        # 2. Inflow Vector (RM to Surface) - The "White Dotted" line
-        h.ax.plot([RM[0].magnitude, u[0].magnitude], [RM[1].magnitude, v[0].magnitude], 
-                  color='white', linewidth=2, linestyle=':', zorder=4)
-
-        # 3. 0-3km SRH bounds (Cyan)
-        # Note: We don't draw the RM->SFC line here anymore because the white dotted line already does it!
-        h.ax.plot([RM[0].magnitude, u[idx_3km].magnitude], [RM[1].magnitude, v[idx_3km].magnitude], 
-                  color='cyan', linewidth=2, linestyle='--', label='0-3km RM Bounds', zorder=5)
+            # 2. 0-3km RM Bounds (Cyan)
+            h.ax.plot([rm_u_shp, u[idx_3km].magnitude], [rm_v_shp, v[idx_3km].magnitude], 
+                      color='cyan', linewidth=2, linestyle='--', label='0-3km RM Bounds', zorder=5)
 
         # --- DYNAMIC EFFECTIVE SRH HODOGRAPH SHADING ---
         if 'eil_pbot' in locals() and eil_pbot is not None and eil_ptop is not None and not np.isnan(eil_pbot.magnitude):
