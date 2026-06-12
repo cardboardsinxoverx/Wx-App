@@ -580,6 +580,14 @@ async def generate_skewt_plot(args):
         td_list = list(np.nan_to_num(Td.magnitude, nan=-9999.0))
         z_list = list(np.nan_to_num(z.magnitude, nan=-9999.0))
         
+        # --- HEIGHT SANITIZER (GLOBAL BALLOON FIX) ---
+        # SHARPpy crashes if balloon data has duplicate or decreasing heights.
+        # We enforce strict monotonicity by bumping bad heights by 1 meter.
+        for i in range(1, len(z_list)):
+            if z_list[i] != -9999.0 and z_list[i-1] != -9999.0:
+                if z_list[i] <= z_list[i-1]:
+                    z_list[i] = z_list[i-1] + 1.0
+        
         # 2. SHARPpy expects Wind Direction & Speed, NOT U & V components! 
         wdir_list = list(np.nan_to_num(mpcalc.wind_direction(u, v).to('degrees').magnitude, nan=-9999.0))
         wspd_list = list(np.nan_to_num(np.sqrt(u**2 + v**2).to('knots').magnitude, nan=-9999.0))
