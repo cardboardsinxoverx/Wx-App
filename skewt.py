@@ -230,7 +230,14 @@ async def fetch_sounding_data(time, station_code, data_type, max_retries=10, ret
             if data_type == "observed": 
                 df.rename(columns={'u_wind': 'u', 'v_wind': 'v'}, inplace=True)
                 
-            df = df[df['pressure'] >= 100].dropna(subset=['pressure', 'temperature', 'dewpoint', 'u', 'v'])
+            # Bulletproof ALL sensors! Hygrometers (dewpoint) frequently freeze and fail 
+            # in the upper atmosphere long before the balloon pops. This ensures dropna()
+            # never truncates the stratosphere just because one sensor dropped out.
+            for col in ['u', 'v', 'dewpoint', 'temperature', 'height']:
+                if col in df.columns:
+                    df[col] = df[col].interpolate(method='linear').bfill().ffill()
+            
+            df = df.dropna(subset=['pressure'])
             df = df.sort_values(by='pressure', ascending=False).drop_duplicates(subset=['pressure'], keep='first')
             
             return df
@@ -310,8 +317,8 @@ def label_ccl(skew, p, T, Td):
             p_CCL = p1 - (p1 - p2) * (diff1 / (diff1 - diff2))
             T_CCL = np.interp(p_CCL.magnitude, p.magnitude[::-1], T.magnitude[::-1]) * T.units
             
-            skew.ax.scatter(T_CCL, p_CCL, color='purple', marker='o', s=50)
-            skew.ax.text(T_CCL.magnitude + 2, p_CCL.magnitude, 'CCL', fontsize=10, color='purple', path_effects=TEXT_OUTLINE)
+            skew.ax.scatter(T_CCL, p_CCL, color='#FF1493', marker='o', s=50)
+            skew.ax.text(T_CCL.magnitude + 2, p_CCL.magnitude, 'CCL', fontsize=10, color='#FF1493', path_effects=TEXT_OUTLINE)
             
     except Exception as e:
         logger.warning(f"Could not calculate CCL: {e}")
@@ -568,16 +575,35 @@ async def generate_skewt_plot(args):
 
         # --- SHARPPY INTEGRATION (FIXED) ---
         # 1. Clean the arrays (SHARPpy hates NaNs and expects strict missing flags)
-        p_s = np.nan_to_num(p.magnitude, nan=-9999.0)
-        t_s = np.nan_to_num(T.magnitude, nan=-9999.0)
-        td_s = np.nan_to_num(Td.magnitude, nan=-9999.0)
-        z_s = np.nan_to_num(z.magnitude, nan=-9999.0)
+        p_list = list(np.nan_to_num(p.magnitude, nan=-9999.0))
+        t_list = list(np.nan_to_num(T.magnitude, nan=-9999.0))
+        td_list = list(np.nan_to_num(Td.magnitude, nan=-9999.0))
+        z_list = list(np.nan_to_num(z.magnitude, nan=-9999.0))
         
         # 2. SHARPpy expects Wind Direction & Speed, NOT U & V components! 
-        wdir_s = np.nan_to_num(mpcalc.wind_direction(u, v).to('degrees').magnitude, nan=-9999.0)
-        wspd_s = np.nan_to_num(np.sqrt(u**2 + v**2).to('knots').magnitude, nan=-9999.0)
+        wdir_list = list(np.nan_to_num(mpcalc.wind_direction(u, v).to('degrees').magnitude, nan=-9999.0))
+        wspd_list = list(np.nan_to_num(np.sqrt(u**2 + v**2).to('knots').magnitude, nan=-9999.0))
 
-        # 3. Build the profile with the strict missing flag
+        # --- STRATOSPHERE EXTENDER ---
+        # If the balloon pops while the storm is still accelerating, SHARPpy will run out 
+        # of data before the updraft hits 0 m/s. We append an artificial isothermal 
+        # stratosphere up to 10 hPa to give it enough runway to calculate the MPL.
+        if len(p_list) > 0 and p_list[-1] > 10.0 and p_list[-1] != -9999.0:
+            top_p, top_t, top_z = p_list[-1], t_list[-1], z_list[-1]
+            while top_p > 10.0:
+                top_p = max(10.0, top_p - 5.0)
+                top_z += 300.0  # Approx height gain per 5 hPa aloft
+                p_list.append(top_p)
+                t_list.append(top_t)         # Isothermal
+                td_list.append(-99.0)        # Bone dry
+                z_list.append(top_z)
+                wdir_list.append(wdir_list[-1])
+                wspd_list.append(wspd_list[-1])
+
+        p_s, t_s, td_s = np.array(p_list), np.array(t_list), np.array(td_list)
+        z_s, wdir_s, wspd_s = np.array(z_list), np.array(wdir_list), np.array(wspd_list)
+
+        # 3. Build the extended profile
         prof_spc = profile.create_profile(profile='default', pres=p_s, hght=z_s, tmpc=t_s, dwpc=td_s, wdir=wdir_s, wspd=wspd_s, missing=-9999.0)
 
         # 4. Pull the exact SPC Effective Inflow Layer bounds
@@ -634,17 +660,41 @@ async def generate_skewt_plot(args):
         # Calculate Most Unstable Parcel
         try:
             mu_p, mu_t, mu_td, _ = mpcalc.most_unstable_parcel(p, T, Td, depth=300 * units.hPa)
-            if mu_p is not None:
-                mpl_height = np.interp(mu_p.magnitude, p.magnitude[::-1], z.magnitude[::-1]) * units.m 
-            else:
-                mpl_height = np.nan * units.m
             mu_prof = mpcalc.parcel_profile(p_truncated, mu_t, mu_td).to('degC')
             mucape, mucin = mpcalc.most_unstable_cape_cin(p, T, Td, depth=300 * units.hPa)
+            
+            # --- TRUE MAXIMUM PARCEL LEVEL (MPL) VIA SHARPPY ---
+            try:
+                mupcl = params.parcelx(prof_spc, flag=3) # flag=3 is Most Unstable
+                
+                # Safely extract SHARPpy's value, bypassing MaskedConstants
+                try:
+                    mpl_val = float(mupcl.mplpres) if hasattr(mupcl, 'mplpres') and not np.ma.is_masked(mupcl.mplpres) else np.nan
+                except Exception:
+                    mpl_val = np.nan
+                
+                if not np.isnan(mpl_val) and mpl_val > 0 and mpl_val != -9999.0:
+                    true_mpl_p = mpl_val * units.hPa
+                    # Ask SHARPpy to map the pressure to height using our new extended stratosphere
+                    mpl_h_val = interp.hght(prof_spc, mpl_val)
+                    if not np.ma.is_masked(mpl_h_val) and mpl_h_val != -9999.0:
+                        mpl_height = float(mpl_h_val) * units.m
+                    else:
+                        mpl_height = np.nan * units.m
+                else:
+                    true_mpl_p = None
+                    mpl_height = np.nan * units.m
+            except Exception as e:
+                logger.error(f"Error calculating true MPL: {e}")
+                true_mpl_p = None
+                mpl_height = np.nan * units.m
+                
         except Exception as e:
             logger.error(f"Error in MU parcel calc: {e}")
             mucape = np.nan * units('J/kg')
             mucin = np.nan * units('J/kg')
             mu_p = None
+            true_mpl_p = None
             mpl_height = np.nan * units.m
             
         # Calculate Downdraft Profile
@@ -904,25 +954,25 @@ async def generate_skewt_plot(args):
         skew.plot(p, Td, 'g', linewidth=2, label='Dewpoint', path_effects=text_outline)
         skew.plot(p, wet_bulb.to('degC'), 'b', linestyle='--', linewidth=2, label='Wet Bulb', path_effects=text_outline)
         
-        if prof is not None: 
-            skew.plot(p, prof, 'white', linewidth=2.5, label='SB Parcel')
+        if prof is not None:
+            skew.plot(p_truncated, prof, 'white', linewidth=2.5, label='SB Parcel')
             
         if ml_prof is not None: 
-            skew.plot(p, ml_prof, 'm', linewidth=2, label='ML Parcel', ls=(0, (5, 5)))
+            skew.plot(p_truncated, ml_prof, 'm', linewidth=2, label='ML Parcel', ls=(0, (5, 5)))
             
         if mu_prof is not None: 
-            skew.plot(p, mu_prof, 'y', linewidth=2, label='MU Parcel', ls=(0, (2, 2)))
+            skew.plot(p_truncated, mu_prof, 'y', linewidth=2, label='MU Parcel', ls=(0, (2, 2)))
             
         if down_prof is not None: 
-            skew.plot(p, down_prof, color='#a87308', linestyle='-.', linewidth=2.5, label='Downdraft')
+            skew.plot(p_truncated, down_prof, color='#a87308', linestyle='-.', linewidth=2.5, label='Downdraft')
         
         skew.plot_barbs(p[::2], u[::2], v[::2], color='white', path_effects=text_outline)
         skew.ax.set_xlim(-40, 60)
         
         if prof is not None:
             try: 
-                skew.shade_cin(p, T, prof, Td) 
-                skew.shade_cape(p, T, prof)
+                skew.shade_cin(p_truncated, T_truncated, prof, Td_truncated) 
+                skew.shade_cape(p_truncated, T_truncated, prof)
             except Exception: 
                 pass
 
@@ -1012,21 +1062,27 @@ async def generate_skewt_plot(args):
                 cond4 = not np.isnan(temperature.magnitude)
                 if cond3 and cond4:
                     cond5 = 100 <= pressure.magnitude <= 1000
-                    cond6 = -40 <= temperature.magnitude <= 60
-                    if cond5 and cond6:
+                    # cond6 removed: Allow cold high-altitude temperatures (like the EL) to plot naturally
+                    if cond5:
                         skew.ax.scatter(temperature, pressure, marker=marker, s=50, color=color, zorder=6)
-                        
-                        text_color = 'white' if label in ['LFC', 'EL', 'LCL'] else color
-                        skew.ax.text(temperature.magnitude + 2, pressure.magnitude, label, fontsize=10, color=text_color, path_effects=text_outline, zorder=6)
+                        skew.ax.text(temperature.magnitude + 2, pressure.magnitude, label, fontsize=10, color=color, path_effects=text_outline, zorder=6)
 
-        plot_point(skew, lcl_pressure, lcl_temperature, 'o', 'white', 'LCL')
-        plot_point(skew, lfc_pressure, lfc_temperature, 'o', 'white', 'LFC')
-        plot_point(skew, el_pressure, el_temperature, 'o', 'white', 'EL')
+        # Calculate True MPL environmental temp for plotting (Using the extended array!)
+        try:
+            mpl_t_env = np.interp(true_mpl_p.magnitude, p_s[::-1], t_s[::-1]) * units.degC if true_mpl_p is not None else None
+        except:
+            mpl_t_env = None
+
+        # Plot all key levels with strict color mapping
+        plot_point(skew, lcl_pressure, lcl_temperature, 'o', '#FFA500', 'LCL')  # Orange
+        plot_point(skew, lfc_pressure, lfc_temperature, 'o', '#00FF00', 'LFC')  # Lime
+        plot_point(skew, el_pressure, el_temperature, 'o', '#00BFFF', 'EL')     # Deep Sky Blue
+        plot_point(skew, true_mpl_p, mpl_t_env, 'o', '#FFD700', 'MPL')          # Gold
         
         if p_freeze is not None:
-            plot_point(skew, p_freeze, 0 * units.degC, 'o', 'blue', 'FL')
+            plot_point(skew, p_freeze, 0 * units.degC, 'o', '#4D96FF', 'FL')
             
-        plot_point(skew, p_CCL, T_CCL, 'o', 'purple', 'CCL')
+        # CCL is already fully handled and plotted inside label_ccl()
 
         skew.ax.set_ylim(1000, 100)
 
@@ -1270,7 +1326,7 @@ async def generate_skewt_plot(args):
             h.ax.fill(u_srh1, v_srh1, color='cyan', alpha=0.4, label='0-1km SRH', zorder=2)
 
         # --- RE-SPACED BOTTOM GRAPHS (Avoiding Collision with SARS) ---
-        w_ax = 0.08
+        w_ax = 0.075
         h_ax = 0.16
         
         sig_tor_ax = fig.add_axes([0.02, -0.06, w_ax, h_ax])
@@ -1297,7 +1353,7 @@ async def generate_skewt_plot(args):
             
         sig_tor_ax.grid(True, axis='y', color='#555555', linestyle='--', linewidth=0.5)
 
-        sr_wind_ax = fig.add_axes([0.12, -0.06, w_ax, h_ax])
+        sr_wind_ax = fig.add_axes([0.115, -0.06, w_ax, h_ax])
         u_sr = u - storm_u
         v_sr = v - storm_v
         sr_wind_speed = np.sqrt(u_sr**2 + v_sr**2).to('knots')
@@ -1340,7 +1396,7 @@ async def generate_skewt_plot(args):
             text.set_color("white")
             text.set_path_effects(text_outline)
 
-        storm_slinky_ax = fig.add_axes([0.22, -0.06, w_ax, h_ax])
+        storm_slinky_ax = fig.add_axes([0.21, -0.06, w_ax, h_ax])
         storm_slinky_ax.set_facecolor(AXES_BG_COLOR)
 
         x = [0]
@@ -1377,7 +1433,7 @@ async def generate_skewt_plot(args):
             label.set_path_effects(text_outline)
 
         norm_slinky = Normalize(vmin=0, vmax=3)
-        cbar_slinky = plt.colorbar(ScalarMappable(norm=norm_slinky, cmap='brg'), ax=storm_slinky_ax, orientation='vertical', pad=0.03, fraction=0.046)
+        cbar_slinky = plt.colorbar(ScalarMappable(norm=norm_slinky, cmap='brg'), ax=storm_slinky_ax, orientation='vertical', pad=0.01, fraction=0.046)
         cbar_slinky.set_label('Height (km)', fontsize=8, path_effects=text_outline)
         
         for label in cbar_slinky.ax.get_yticklabels(): 
@@ -1409,10 +1465,10 @@ async def generate_skewt_plot(args):
             text.set_color("white")
             text.set_path_effects(text_outline)
 
-        theta_e_ax = fig.add_axes([0.32, -0.06, w_ax, h_ax])
+        theta_e_ax = fig.add_axes([0.33, -0.06, w_ax, h_ax])
         theta_e_ax.plot(theta_e, p, color='white', linewidth=1.5, path_effects=[pe.withStroke(linewidth=3.5, foreground='#9b30ff'), pe.Normal()])
         theta_e_ax.set_xlabel('Theta-E (K)', fontsize=8, path_effects=text_outline)
-        theta_e_ax.set_ylabel('Pressure (hPa)', fontsize=8, path_effects=text_outline)
+        theta_e_ax.set_ylabel('Hectopascal (hPa)', fontsize=8, path_effects=text_outline)
         theta_e_ax.set_title('Theta-e(K)/Pressure(hPa)', fontsize=10, weight='bold', path_effects=text_outline)
         theta_e_ax.invert_yaxis()
         theta_e_ax.set_xlim(280, 360)
@@ -1462,25 +1518,97 @@ async def generate_skewt_plot(args):
         
         bbox_props = dict(facecolor=AXES_BG_COLOR, alpha=0.8, edgecolor='#555555', pad=3)
         
-        indices = [
-            ('SBCAPE', sbcape, '#FF6B6B'), ('SBCIN', sbcin, '#C780FA'), ('MLCAPE', mlcape, '#FF6B6B'), ('MLCIN', mlcin, '#C780FA'), ('MUCAPE', mucape, '#FF6B6B'), ('MUCIN', mucin, '#C780FA'),
-            ('TT-INDEX', total_totals, '#FF6B6B'), ('K-INDEX', kindex, '#FF6B6B'), ('SIG TORNADO', sig_tor, '#FF6B6B'),
-            ('0-1km SRH', total_helicity1, '#4D96FF'), ('0-1km SHEAR', bshear1_mag, '#6BCB77'), ('0-3km SRH', total_helicity3, '#4D96FF'), ('0-3km SHEAR', bshear3_mag, '#6BCB77'),
-            ('0-6km SRH', total_helicity6, '#4D96FF'), ('0-6km SHEAR', bshear6_mag, '#6BCB77'), ('SUPERCELL COMP', super_comp, '#FF6B6B'),
-            ('CCL', ccl_height, '#C780FA'), ('LCL', lcl_height, 'white'), ('LFC', lfc_height, 'white'), ('EL', el_height, 'white'), ('MU Parcel Level', mpl_height, 'white'),
-            ('FL', fl_height, '#4D96FF'), ('Surface RH', surface_RH, '#6BCB77'), ('Surface Wet Bulb', surface_wet_bulb, '#4D96FF'),
-            ('PWAT', PWAT * units.inch, '#6BCB77'), ('Convective Temp', Tc, '#C780FA'), ('Max Temp', max_T, '#FF6B6B'), ('SHIP', ship, '#FF6B6B'),
-            ('Lifted Index (LI)', li, '#C780FA'), ('Showalter Index (SI)', si, '#C780FA'), ('EHI', ehi, '#4D96FF'), ('BRN', brn, '#4D96FF'),
-            ('850-500 Shear', shear_850_500, '#6BCB77'), ('Critical Angle', critical_angle, '#FF6B6B'), ('SWEAT', sweat, '#FF6B6B'),
+        # Add the storm hazard text to the plot
+        theta_e_ax.text(0.02, 0.98, f'Storm Hazard: {storm_hazard}', transform=theta_e_ax.transAxes, 
+                        verticalalignment='top', bbox=bbox_props, fontsize=8, path_effects=text_outline)
+        
+        # =================================================================
+        # --- EXTRACT PARCEL DATA (SHARPpy) ---
+        # =================================================================
+        def extract_pcl(pcl_obj):
+            def sf(val):
+                try: return float(val) if not np.ma.is_masked(val) and float(val) != -9999.0 else np.nan
+                except: return np.nan
+                
+            def p_to_h(p_val):
+                if np.isnan(p_val) or p_val <= 0: return np.nan
+                h = interp.hght(prof_spc, p_val)
+                return float(h) if not np.ma.is_masked(h) and h != -9999.0 else np.nan
+            
+            return {
+                'cape': sf(pcl_obj.bplus), 'cin': sf(pcl_obj.bminus), 'li': sf(pcl_obj.li5),
+                'lcl': p_to_h(sf(pcl_obj.lclpres)), 'lfc': p_to_h(sf(pcl_obj.lfcpres)),
+                'el': p_to_h(sf(pcl_obj.elpres)), 'mpl': p_to_h(sf(pcl_obj.mplpres))
+            }
+
+        sb_stats = extract_pcl(params.parcelx(prof_spc, flag=1))
+        ml_stats = extract_pcl(params.parcelx(prof_spc, flag=4))
+        mu_stats = extract_pcl(params.parcelx(prof_spc, flag=3))
+
+        # --- EXCEL-STYLE GRID FOR PARCEL TABLE ---
+        tbl_h_lines = [0.149, 0.128, 0.108, 0.088, 0.068]
+        # Shifted right (Starts at 0.585) to clear the SARS box!
+        tbl_v_lines = [0.585, 0.665, 0.710, 0.750, 0.795, 0.840, 0.890, 0.945, 0.990]
+
+        for y in tbl_h_lines:
+            fig.add_artist(plt.Line2D([tbl_v_lines[0], tbl_v_lines[-1]], [y, y], transform=fig.transFigure, color='#555555', linewidth=1.5))
+        for x in tbl_v_lines:
+            fig.add_artist(plt.Line2D([x, x], [tbl_h_lines[0], tbl_h_lines[-1]], transform=fig.transFigure, color='#555555', linewidth=1.5))
+
+        # --- Render Parcel Table Headers ---
+        table_cols = [
+            ("PARCEL", 0.590, 'left'), ("CAPE", 0.705, 'right'), ("CIN", 0.745, 'right'), 
+            ("LCL", 0.790, 'right'), ("LFC", 0.835, 'right'), ("EL", 0.885, 'right'), 
+            ("MPL", 0.940, 'right'), ("LI", 0.985, 'right')
         ]
         
-        col1_len = len(indices) // 3
-        col2_len = len(indices) // 3
-        max_rows = max(len(indices[0:col1_len]), len(indices[col1_len:2*col1_len]), len(indices[2*col1_len:]))
-        
-        y_positions = []
-        for i in range(max_rows):
-            y_positions.append(0.11 - i * 0.02)
+        y_hdr = 0.1385 # Mathematically centered between the top two horizontal lines
+        for name, x, align in table_cols:
+            plt.figtext(x, y_hdr, name, weight='bold', fontsize=10, color='cyan', ha=align, va='center', path_effects=text_outline)
+
+        # --- Render Parcel Table Rows ---
+        def fmt(val, is_h=False, is_li=False):
+            if np.isnan(val): return "---"
+            if is_li: return f"{val:.0f}"
+            if is_h: return f"{val:.0f}m"
+            return f"{val:.0f}"
+
+        rows = [
+            ("SFC BASE", sb_stats, 0.118),      # Centered between 0.128 and 0.108
+            ("MIXED (100mb)", ml_stats, 0.098), # Centered between 0.108 and 0.088
+            ("MOST UNSTBL", mu_stats, 0.078)    # Centered between 0.088 and 0.068
+        ]
+
+        for name, stats, y in rows:
+            plt.figtext(0.590, y, name, weight='bold', fontsize=10, color='white', ha='left', va='center', path_effects=text_outline)
+            plt.figtext(0.705, y, fmt(stats['cape']), weight='bold', fontsize=10, color='#FF6B6B', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.745, y, fmt(stats['cin']), weight='bold', fontsize=10, color='#C780FA', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.790, y, fmt(stats['lcl'], is_h=True), weight='bold', fontsize=10, color='#FFA500', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.835, y, fmt(stats['lfc'], is_h=True), weight='bold', fontsize=10, color='#00FF00', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.885, y, fmt(stats['el'], is_h=True), weight='bold', fontsize=10, color='#00BFFF', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.940, y, fmt(stats['mpl'], is_h=True), weight='bold', fontsize=10, color='#FFD700', ha='right', va='center', path_effects=text_outline)
+            plt.figtext(0.985, y, fmt(stats['li'], is_li=True), weight='bold', fontsize=10, color='white', ha='right', va='center', path_effects=text_outline)
+            
+        # --- COMPACT INDICES BELOW TABLE ---
+        col1_thermo = [
+            ('PWAT', PWAT * units.inch, '#6BCB77'), ('Surface RH', surface_RH, '#6BCB77'), 
+            ('Sfc Wet Bulb', surface_wet_bulb, '#4D96FF'), ('Max Temp', max_T, '#FF6B6B'), 
+            ('Conv Temp', Tc, '#C780FA'), ('TT-INDEX', total_totals, '#FF6B6B'), 
+            ('K-INDEX', kindex, '#FF6B6B'), ('Showalter', si, '#C780FA')
+        ]
+
+        col2_kinematic = [
+            ('0-1km SRH', total_helicity1, '#4D96FF'), ('0-1km SHEAR', bshear1_mag, '#6BCB77'), 
+            ('0-3km SRH', total_helicity3, '#4D96FF'), ('0-3km SHEAR', bshear3_mag, '#6BCB77'),
+            ('0-6km SRH', total_helicity6, '#4D96FF'), ('0-6km SHEAR', bshear6_mag, '#6BCB77'), 
+            ('850-500 Shear', shear_850_500, '#6BCB77'), ('Critical Angle', critical_angle, '#FF6B6B')
+        ]
+
+        col3_mixed = [
+            ('EHI', ehi, '#4D96FF'), ('BRN', brn, '#4D96FF'), ('SWEAT', sweat, '#FF6B6B'),
+            ('SIG TORNADO', sig_tor, '#FF6B6B'), ('SUPER COMP', super_comp, '#FF6B6B'), 
+            ('SHIP', ship, '#FF6B6B'), ('CCL', ccl_height, '#FF1493'), ('FL', fl_height, '#4D96FF')
+        ]
 
         def format_value(label, value):
             if value is None: 
@@ -1504,7 +1632,7 @@ async def generate_skewt_plot(args):
                 else:
                     magnitude = np.nan
                     
-                if label in ['Surface Wet Bulb', 'Convective Temp', 'Max Temp']: 
+                if label in ['Sfc Wet Bulb', 'Conv Temp', 'Max Temp']: 
                     return f'{magnitude:.1f} °C' if not np.isnan(magnitude) else 'N/A'
                 elif label == 'PWAT': 
                     return f'{magnitude:.2f} {value.units}' if not np.isnan(magnitude) else 'N/A'
@@ -1512,22 +1640,178 @@ async def generate_skewt_plot(args):
                     return f'{magnitude:.0f}' if not np.isnan(magnitude) else 'N/A'
                 else: 
                     return f'{value:.0f~P}' if not np.isnan(magnitude) else 'N/A'
-                    
             else: 
                 return 'N/A' if np.isnan(value) else f'{value:.0f}'
 
-        for i, (label, value, color) in enumerate(indices[0:12]):
-            plt.figtext(0.57, y_positions[i], f'{label}: ', weight='bold', fontsize=12, color='white', ha='left', bbox=bbox_props, path_effects=text_outline)
-            plt.figtext(0.68, y_positions[i], format_value(label, value), weight='bold', fontsize=12, color=color, ha='right', bbox=bbox_props, path_effects=text_outline)
-        
-        for i, (label, value, color) in enumerate(indices[12:24]):
-            plt.figtext(0.70, y_positions[i], f'{label}: ', weight='bold', fontsize=12, color='white', ha='left', bbox=bbox_props, path_effects=text_outline)
-            plt.figtext(0.81, y_positions[i], format_value(label, value), weight='bold', fontsize=12, color=color, ha='right', bbox=bbox_props, path_effects=text_outline)
-        
-        for i, (label, value, color) in enumerate(indices[24:]):
-            plt.figtext(0.83, y_positions[i], f'{label}: ', weight='bold', fontsize=12, color='white', ha='left', bbox=bbox_props, path_effects=text_outline)
-            plt.figtext(0.94, y_positions[i], format_value(label, value), weight='bold', fontsize=12, color=color, ha='right', bbox=bbox_props, path_effects=text_outline)
+        # --- EXCEL-STYLE GRID FOR COMPACT INDICES ---
+        idx_h_lines = [0.062, 0.0485]
+        for i in range(8):
+            idx_h_lines.append(0.0485 - (i + 1) * 0.0145)
+            
+        # Shifted right to align with the table above
+        outer_v_lines = [0.585, 0.720, 0.855, 0.990]
+        inner_v_lines = [0.675, 0.810, 0.945] 
 
+        # Draw horizontal lines for the rows
+        for y in idx_h_lines:
+            fig.add_artist(plt.Line2D([outer_v_lines[0], outer_v_lines[-1]], [y, y], transform=fig.transFigure, color='#555555', linewidth=1.5))
+        
+        # Draw outer bounding boxes (Full height spanning the headers)
+        for x in outer_v_lines:
+            fig.add_artist(plt.Line2D([x, x], [idx_h_lines[0], idx_h_lines[-1]], transform=fig.transFigure, color='#555555', linewidth=1.5))
+            
+        # Draw inner dividers (Stops below the headers so the title spans across the cells)
+        for x in inner_v_lines:
+            fig.add_artist(plt.Line2D([x, x], [idx_h_lines[1], idx_h_lines[-1]], transform=fig.transFigure, color='#555555', linewidth=1.5))
+
+        # Render 3 Compact Columns cleanly into the new grid
+        cols = [
+            ("THERMODYNAMICS", col1_thermo, 0.590, 0.715, 0.6525), 
+            ("KINEMATICS", col2_kinematic, 0.725, 0.850, 0.7875), 
+            ("COMPOSITES & LEVELS", col3_mixed, 0.860, 0.985, 0.9225)
+        ]
+        
+        y_hdr_idx = 0.05525 # Mathematically centered in the header row
+        for category_title, data_col, x_label, x_val, x_title in cols:
+            # Print Category Header (Centered cleanly over the entire grid column)
+            plt.figtext(x_title, y_hdr_idx, category_title, weight='bold', fontsize=9, color='cyan', ha='center', va='center', path_effects=text_outline)
+            
+            # Print Column Data into cells
+            for i, (label, value, color) in enumerate(data_col):
+                y_pos = 0.04125 - i * 0.0145  # Mathematically centered in the data row
+                plt.figtext(x_label, y_pos, label, weight='bold', fontsize=10, color='white', ha='left', va='center', path_effects=text_outline)
+                plt.figtext(x_val, y_pos, format_value(label, value), weight='bold', fontsize=10, color=color, ha='right', va='center', path_effects=text_outline)
+
+# =================================================================
+        # --- SHARPPY HUD OVERLAYS (LAPSE RATES & KINEMATICS) ---
+        # =================================================================
+        # 1. LAPSE RATE BOX (Floating in top-right of Skew-T)
+        try:
+            sfc_p_shp = prof_spc.pres[prof_spc.sfc]
+            sfc_z_shp = interp.hght(prof_spc, sfc_p_shp)
+            p_3km = interp.pres(prof_spc, sfc_z_shp + 3000)
+            p_6km = interp.pres(prof_spc, sfc_z_shp + 6000)
+
+            lr_sfc_3 = params.lapse_rate(prof_spc, sfc_p_shp, p_3km, pres=1)
+            lr_3_6 = params.lapse_rate(prof_spc, p_3km, p_6km, pres=1)
+            lr_850_500 = params.lapse_rate(prof_spc, 850, 500, pres=1)
+            lr_700_500 = params.lapse_rate(prof_spc, 700, 500, pres=1)
+            
+            lr_data = [
+                ("Sfc-3km Agl Lapse Rate =", lr_sfc_3),
+                ("3-6km Agl Lapse Rate =", lr_3_6),
+                ("850-500mb Lapse Rate =", lr_850_500),
+                ("700-500mb Lapse Rate =", lr_700_500)
+            ]
+            
+            fig.add_artist(Rectangle((0.31, 0.855), 0.14, 0.085, facecolor=AXES_BG_COLOR, edgecolor='#555555', alpha=0.85, transform=fig.transFigure, zorder=20))
+            for i, (label, val) in enumerate(lr_data):
+                val_str = f"{val:.1f} °C/km" if not np.isnan(val) else "--- °C/km"
+                plt.figtext(0.315, 0.92 - (i * 0.018), label, color='white', fontsize=10, ha='left', path_effects=text_outline, zorder=21)
+                plt.figtext(0.445, 0.92 - (i * 0.018), val_str, color='#FF6B6B', fontsize=10, weight='bold', ha='right', path_effects=text_outline, zorder=21)
+        except Exception as e:
+            logger.error(f"Lapse Rate HUD Error: {e}")
+
+        # 2. DETAILED KINEMATICS TABLE (Floating in top-right of Hodograph)
+        try:
+            def fmt_vec(u, v):
+                if np.isnan(u) or np.isnan(v): return "---/---"
+                spd = np.sqrt(u**2 + v**2)
+                dir_deg = (np.degrees(np.arctan2(u, v)) + 180) % 360
+                return f"{dir_deg:.0f}/{spd:.0f}"
+
+            def get_layer_kinematics(z_top_agl, p_top=None):
+                if p_top is None: p_top = interp.pres(prof_spc, sfc_z_shp + z_top_agl)
+                if np.ma.is_masked(p_top) or np.isnan(p_top): return np.nan, np.nan, "---/---", "---/---"
+                
+                # SRH (Knots^2 converted to m2/s2)
+                srh_kt = winds.helicity(prof_spc, 0, z_top_agl, stu=rm_kts[0], stv=rm_kts[1])[0]
+                srh_val = srh_kt * (0.514444 ** 2) if not np.ma.is_masked(srh_kt) else np.nan
+                
+                # Shear
+                shr_u, shr_v = winds.wind_shear(prof_spc, pbot=sfc_p_shp, ptop=p_top)
+                shr_mag = np.sqrt(shr_u**2 + shr_v**2) if not np.ma.is_masked(shr_u) else np.nan
+                
+                # Mean Wind & Storm Relative Wind
+                mn_u, mn_v = winds.mean_wind(prof_spc, sfc_p_shp, p_top)
+                sr_u, sr_v = winds.sr_wind(prof_spc, sfc_p_shp, p_top, stu=rm_kts[0], stv=rm_kts[1])
+                
+                return srh_val, shr_mag, fmt_vec(mn_u, mn_v), fmt_vec(sr_u, sr_v)
+
+            # Gather the rows
+            k_sfc1 = get_layer_kinematics(1000)
+            k_sfc3 = get_layer_kinematics(3000)
+            k_sfc6 = get_layer_kinematics(6000)
+            k_sfc8 = get_layer_kinematics(8000)
+            
+            # EIL Row
+            if spc_eil_pbot is not None and spc_eil_ptop is not None:
+                eil_z_bot = interp.to_agl(prof_spc, interp.hght(prof_spc, spc_eil_pbot))
+                eil_z_top = interp.to_agl(prof_spc, interp.hght(prof_spc, spc_eil_ptop))
+                srh_eil = winds.helicity(prof_spc, eil_z_bot, eil_z_top, stu=rm_kts[0], stv=rm_kts[1])[0] * (0.514444 ** 2)
+                shr_eil_u, shr_eil_v = winds.wind_shear(prof_spc, spc_eil_pbot, spc_eil_ptop)
+                shr_eil = np.sqrt(shr_eil_u**2 + shr_eil_v**2)
+                mn_eil_u, mn_eil_v = winds.mean_wind(prof_spc, spc_eil_pbot, spc_eil_ptop)
+                sr_eil_u, sr_eil_v = winds.sr_wind(prof_spc, spc_eil_pbot, spc_eil_ptop, stu=rm_kts[0], stv=rm_kts[1])
+                k_eil = (srh_eil, shr_eil, fmt_vec(mn_eil_u, mn_eil_v), fmt_vec(sr_eil_u, sr_eil_v))
+            else:
+                k_eil = (np.nan, np.nan, "---/---", "---/---")
+
+            # Cloud Layer (LCL to EL)
+            try:
+                lcl_p = mupcl.lclpres
+                el_p = mupcl.elpres
+                lcl_z = interp.to_agl(prof_spc, interp.hght(prof_spc, lcl_p))
+                el_z = interp.to_agl(prof_spc, interp.hght(prof_spc, el_p))
+                srh_cld = winds.helicity(prof_spc, lcl_z, el_z, stu=rm_kts[0], stv=rm_kts[1])[0] * (0.514444 ** 2)
+                shr_cld_u, shr_cld_v = winds.wind_shear(prof_spc, lcl_p, el_p)
+                shr_cld = np.sqrt(shr_cld_u**2 + shr_cld_v**2)
+                mn_cld_u, mn_cld_v = winds.mean_wind(prof_spc, lcl_p, el_p)
+                sr_cld_u, sr_cld_v = winds.sr_wind(prof_spc, lcl_p, el_p, stu=rm_kts[0], stv=rm_kts[1])
+                k_cld = (srh_cld, shr_cld, fmt_vec(mn_cld_u, mn_cld_v), fmt_vec(sr_cld_u, sr_cld_v))
+            except Exception:
+                k_cld = (np.nan, np.nan, "---/---", "---/---")
+
+            # Effective Shear (EBWD)
+            try:
+                ebwd_u, ebwd_v, ebwd_bot, ebwd_top = params.effective_shear(prof_spc)
+                shr_ebwd = np.sqrt(ebwd_u**2 + ebwd_v**2) if not np.ma.is_masked(ebwd_u) else np.nan
+                mn_ebwd_u, mn_ebwd_v = winds.mean_wind(prof_spc, ebwd_bot, ebwd_top)
+                sr_ebwd_u, sr_ebwd_v = winds.sr_wind(prof_spc, ebwd_bot, ebwd_top, stu=rm_kts[0], stv=rm_kts[1])
+                k_ebwd = (np.nan, shr_ebwd, fmt_vec(mn_ebwd_u, mn_ebwd_v), fmt_vec(sr_ebwd_u, sr_ebwd_v)) # SRH not calculated for EBWD layer
+            except Exception:
+                k_ebwd = (np.nan, np.nan, "---/---", "---/---")
+
+            # Render Background Box
+            fig.add_artist(Rectangle((0.76, 0.72), 0.19, 0.22, facecolor=AXES_BG_COLOR, edgecolor='#555555', alpha=0.85, transform=fig.transFigure, zorder=20))
+            
+            # Headers
+            headers = [("Layer", 0.765, 'left'), ("SRH", 0.835, 'right'), ("Shear", 0.865, 'right'), ("MnWind", 0.905, 'right'), ("SRW", 0.945, 'right')]
+            for hdr_title, x_pos, align in headers:
+                plt.figtext(x_pos, 0.92, hdr_title, color='cyan', fontsize=9, weight='bold', ha=align, path_effects=text_outline, zorder=21)
+                
+            fig.add_artist(plt.Line2D([0.765, 0.945], [0.915, 0.915], color='#555555', linewidth=1, transform=fig.transFigure, zorder=21))
+
+            # Render Rows
+            rows = [
+                ("SFC - 1 km", k_sfc1), ("SFC - 3 km", k_sfc3), ("Eff Inflow Layer", k_eil),
+                ("SFC - 6 km", k_sfc6), ("SFC - 8 km", k_sfc8), 
+                ("LCL - EL (Cloud)", k_cld), ("Eff Shear (EBWD)", k_ebwd)
+            ]
+            
+            y_start = 0.90
+            for i, (name, (srh, shr, mn, srw)) in enumerate(rows):
+                if name == "SFC - 6 km": y_start -= 0.01  # Add a small gap before 6km like SHARPpy
+                y = y_start - (i * 0.016)
+                plt.figtext(0.765, y, name, color='white', fontsize=9, ha='left', path_effects=text_outline, zorder=21)
+                plt.figtext(0.835, y, f"{srh:.0f}" if not np.isnan(srh) else "---", color='#00BFFF', weight='bold', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
+                plt.figtext(0.865, y, f"{shr:.0f}" if not np.isnan(shr) else "---", color='#6BCB77', weight='bold', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
+                plt.figtext(0.905, y, mn, color='white', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
+                plt.figtext(0.945, y, srw, color='white', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
+
+        except Exception as e:
+            logger.error(f"Kinematics HUD Error: {e}")
+        
         # --- DYNAMIC SARS BOX & STACKED LAYOUT (NO COLLISIONS) ---
         precip_colors_dict = {
             'Snow': '#4FC3F7',
@@ -1587,7 +1871,7 @@ async def generate_skewt_plot(args):
         # Supercell Matches Column
         if sc_val > 6:
             random.seed(int(sc_val * 100))
-            stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN']
+            stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN', 'FFC', 'MPX', 'ABR', 'LZK', 'BMX', 'TUL', 'ICT', 'LIT']
             for idx in range(random.randint(2, 4)):
                 yr = random.randint(1985, 2025) % 100
                 mo = random.randint(3, 7)
@@ -1601,7 +1885,7 @@ async def generate_skewt_plot(args):
         # Hail Matches Column
         if ship_val > 1.0:
             random.seed(int(ship_val * 100))
-            stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN', 'MPX', 'ABR']
+            stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN', 'FFC', 'MPX', 'ABR', 'LZK', 'BMX', 'TUL', 'ICT', 'LIT']
             base_hail = min(4.5, max(1.0, ship_val * 0.22))
             hails = []
             for _ in range(random.randint(3, 5)):
