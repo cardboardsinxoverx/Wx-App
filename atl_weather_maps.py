@@ -1,32 +1,43 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Standalone GFS Map Generator for Europe.
+Standalone GFS Map Generator for the Atlantic.
 
 Fetches GFS data from the UCAR THREDDS server and generates various
-meteorological maps.
+meteorological maps for the CONUS East Coast, Caribbean, and Atlantic.
 """
 
 # Section 1: Imports
+import logging
+import io
+import os
+import sys
+import json
+import re
+from datetime import datetime, timedelta, timezone
+import argparse
+
 import matplotlib.pyplot as plt
 import numpy as np
-from datetime import datetime, timedelta, timezone
-from siphon.catalog import TDSCatalog
 import xarray as xr
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
-from scipy import ndimage
-import io
-import time
-import requests
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import cartopy.io.shapereader as shpreader
 from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
-import logging
-from metpy.units import units
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import requests
+
+from scipy import ndimage
+from scipy.ndimage import generate_binary_structure, minimum_filter, gaussian_filter, label, binary_dilation
+from scipy.interpolate import griddata
+from skimage.morphology import skeletonize
+
 import metpy.calc as mpcalc
-import os
-import argparse
-import sys
+from metpy.units import units
+from metpy.plots import ColdFront, WarmFront, StationaryFront, OccludedFront, StationPlot
+from metpy.plots.wx_symbols import sky_cover
+from siphon.catalog import TDSCatalog
+from siphon.simplewebservice.wyoming import WyomingUpperAir
 
 # Section 2: Logging Configuration
 logging.getLogger().setLevel(logging.INFO)
@@ -42,30 +53,144 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(nam
 # Section 3: Constants
 EARTH_RADIUS = 6371000  # meters
 OMEGA = 7.292e-5  # Earth's angular velocity (rad/s)
-REGION = "European"  # Define the region
+REGION = "Atlantic"  # Define the region
 
-# --- MODIFIED: Logo paths are now relative ---
-LOGO_PATHS = ["./metoc.png", "./boxlogo2.png"] 
+# --- MODIFIED: Changed hardcoded paths to relative paths ---
+INTERSTATES_SHP = './shapefiles/tl_2023_us_primaryroads.shp' 
+LOGO_PATHS = ["./photo.jpg", "./boxlogo2.png"]
+ICON_DIR = './icons'
+# ---
+METAR_STATIONS = [
+    'KMIA', 'MUHA', 'TJSJ', 'TXKF', 'MYNN', 'MKJP', 'MTPP', 'KJFK', 'KBOS',
+    'KDCA', 'KCHS', 'KJAX', 'KMSY', 'KBDA', 'MDSD', 'TNCF', 'TNCC'
+]
+SOUNDING_STATIONS = ['MFL', 'JAX', 'CHS', 'XMR', 'LIX'] # Miami, Jacksonville, Charleston, Cape Canaveral, Slidell
 
-# --- NEW: List of major European cities ---
+# List of major Atlantic cities
 cities = [
-    {'name': 'London', 'lat': 51.5074, 'lon': -0.1278},
-    {'name': 'Paris', 'lat': 48.8566, 'lon': 2.3522},
-    {'name': 'Berlin', 'lat': 52.5200, 'lon': 13.4050},
-    {'name': 'Madrid', 'lat': 40.4168, 'lon': -3.7038},
-    {'name': 'Rome', 'lat': 41.9028, 'lon': 12.4964},
-    {'name': 'Dublin', 'lat': 53.3498, 'lon': -6.2603},
-    {'name': 'Oslo', 'lat': 59.9139, 'lon': 10.7522},
-    {'name': 'Stockholm', 'lat': 59.3293, 'lon': 18.0686},
-    {'name': 'Reykjavik', 'lat': 64.1466, 'lon': -21.9426},
-    {'name': 'Lisbon', 'lat': 38.7223, 'lon': -9.1393},
-    {'name': 'Amsterdam', 'lat': 52.3676, 'lon': 4.9041},
-    {'name': 'Prague', 'lat': 50.0755, 'lon': 14.4378},
-    {'name': 'Vienna', 'lat': 48.2082, 'lon': 16.3738},
-    {'name': 'Algiers', 'lat': 36.7762, 'lon': 3.0599},
+    {'name': 'Miami', 'lat': 25.7617, 'lon': -80.1918},
+    {'name': 'San Juan', 'lat': 18.4663, 'lon': -66.1057},
+    {'name': 'Havana', 'lat': 23.1136, 'lon': -82.3666},
+    {'name': 'Nassau', 'lat': 25.0582, 'lon': -77.3431},
+    {'name': 'Kingston', 'lat': 17.9970, 'lon': -76.7936},
+    {'name': 'Port-au-Prince', 'lat': 18.5944, 'lon': -72.3074},
+    {'name': 'New York', 'lat': 40.7128, 'lon': -74.0060},
+    {'name': 'Boston', 'lat': 42.3601, 'lon': -71.0589},
+    {'name': 'Washington', 'lat': 38.9072, 'lon': -77.0369},
+    {'name': 'Charleston', 'lat': 32.7765, 'lon': -79.9311},
+    {'name': 'Jacksonville', 'lat': 30.3322, 'lon': -81.6557},
+    {'name': 'New Orleans', 'lat': 29.9511, 'lon': -90.0715},
+    {'name': 'Bermuda', 'lat': 32.3078, 'lon': -64.7505},
 ]
 
 # Section 4: Helper Functions
+def get_sounding_data(station):
+    """Fetches the latest available sounding data for a given station."""
+    try:
+        now = datetime.now(timezone.utc)
+        times_to_try = [
+            now.replace(hour=12, minute=0, second=0, microsecond=0),
+            now.replace(hour=0, minute=0, second=0, microsecond=0),
+            (now - timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+        ]
+        for time in times_to_try:
+            try:
+                df = WyomingUpperAir.request_data(time, station)
+                if not df.empty:
+                    logging.info(f"Successfully fetched sounding for {station} at {time}")
+                    return df
+            except Exception:
+                continue
+        logging.warning(f"Could not fetch sounding data for {station} in the last 24 hours.")
+        return None
+    except Exception as e:
+        logging.error(f"An error occurred fetching sounding data for {station}: {e}")
+        return None
+
+def analyze_sounding_for_fronts(df):
+    """Analyzes a sounding DataFrame for frontal indicators."""
+    if df is None or df.empty:
+        return 0
+
+    p = df['pressure'].values * units.hPa
+    T = df['temperature'].values * units.degC
+    u = df['u_wind'].values * units.knots
+    v = df['v_wind'].values * units.knots
+
+    lower_levels = p > 850 * units.hPa
+    if np.any(lower_levels):
+        temp_diff = np.diff(T[lower_levels])
+        if np.any(temp_diff > 0.5 * units.delta_degC):
+            return 1
+
+    mid_levels = p > 700 * units.hPa
+    if np.sum(mid_levels) > 1:
+        try:
+            shear_u, shear_v = mpcalc.bulk_shear(p[mid_levels], u[mid_levels], v[mid_levels])
+            if np.sqrt(shear_u**2 + shear_v**2).m > 15:
+                return 1
+        except ValueError:
+            pass
+    return 0
+
+def get_metar_data(stations):
+    """Fetches and parses METAR data for a list of station ICAOs."""
+    station_string = ','.join(stations)
+    url = f"https://aviationweather.gov/api/data/metar?ids={station_string}&format=json&hours=2"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+
+        obs_points = []
+        for metar in data:
+            try:
+                point = {
+                    'lat': metar['lat'],
+                    'lon': metar['lon'],
+                    'tmpc': metar.get('temp', np.nan),
+                    'dwpc': metar.get('dewp', np.nan),
+                    'wspd': metar.get('wspd', np.nan),
+                    'wdir': metar.get('wdir', np.nan),
+                    'slp': metar.get('slp', np.nan),
+                    'cover': metar.get('sky_cover', 'CLR')
+                }
+                if not any(np.isnan(v) for k, v in point.items() if k not in ['cover', 'lat', 'lon']):
+                    obs_points.append(point)
+            except (KeyError, TypeError):
+                continue
+        return obs_points
+    except (requests.RequestException, json.JSONDecodeError) as e:
+        logging.error(f"Error fetching METAR data: {e}")
+        return []
+
+def plot_metar_stations(ax, metar_obs):
+    """Plots METAR station data on the map."""
+    if not metar_obs:
+        return
+
+    stationplot = StationPlot(ax, [o['lon'] for o in metar_obs], [o['lat'] for o in metar_obs],
+                              transform=ccrs.PlateCarree(), fontsize=8)
+
+    temps = np.array([o['tmpc'] for o in metar_obs])
+    dewps = np.array([o['dwpc'] for o in metar_obs])
+    slps = np.array([o['slp'] for o in metar_obs])
+
+    sky_cover_map = {'CLR': 0, 'SKC': 0, 'FEW': 1, 'SCT': 3, 'BKN': 5, 'OVC': 8}
+    covers = np.array([sky_cover_map.get(o['cover'], 0) for o in metar_obs])
+
+    stationplot.plot_parameter('NW', temps, color='red')
+    stationplot.plot_parameter('SW', dewps, color='darkgreen')
+    stationplot.plot_parameter('NE', slps, formatter=lambda v: f'{v:.0f}' if not np.isnan(v) else '')
+    stationplot.plot_symbol('C', covers, sky_cover)
+
+    winds = [((o['wspd'] * units.knots).to('m/s').m, o['wdir']) for o in metar_obs]
+    for (spd, dir_), (lon, lat) in zip(winds, [(o['lon'], o['lat']) for o in metar_obs]):
+        if not np.isnan(spd):
+            stationplot.plot_barb(spd * np.cos(np.radians(270 - dir_)),
+                                  spd * np.sin(np.radians(270 - dir_)), 
+                                  length=6)
+
 def compute_wind_speed(u, v):
     """Compute wind speed from u and v components (m/s to knots)."""
     wind_speed_ms = np.sqrt(u**2 + v**2)
@@ -113,7 +238,7 @@ def compute_advection(phi, u, v, lat, lon):
 def compute_dewpoint(T, rh):
     """Compute dewpoint temperature (°C) from temperature (K) and relative humidity (%)."""
     T_C = T - 273.15
-    rh = np.clip(rh, 1e-10, 100) # Ensure rh is positive and <= 100
+    rh = np.clip(rh, 1e-10, 100)
     ln_rh = np.log(rh / 100.0)
     a = 17.67
     b = 243.5
@@ -182,11 +307,10 @@ def frontogenesis_700hPa(T, u, v, lat, lon):
         logging.error(f"Error computing frontogenesis: {e}")
         return None
 
-def get_latest_gfs_run_time():
+def get_latest_run_date():
     """Determines the most recent GFS run time available."""
     now = datetime.now(timezone.utc)
     run_hours = [0, 6, 12, 18]
-    # GFS data is usually available ~6 hours after the run time.
     check_time = now - timedelta(hours=6)
     
     for run_hour in sorted(run_hours, reverse=True):
@@ -194,7 +318,6 @@ def get_latest_gfs_run_time():
             run_date = check_time.replace(hour=run_hour, minute=0, second=0, microsecond=0)
             return run_date
             
-    # If it's before 06Z, use the 18Z run from the previous day
     run_date = (check_time - timedelta(days=1)).replace(hour=18, minute=0, second=0, microsecond=0)
     return run_date
 
@@ -214,7 +337,7 @@ def get_time_dimension(ds, run_date):
         for dim in possible_dims:
             if dim in ds.dims:
                 logging.debug(f"Found time dimension: {dim}")
-                selected_dims[dim] = 0  # Use index 0 for latest run
+                selected_dims[dim] = 0
                 break
         else:
             logging.error(f"No time dimension found. Available dimensions: {ds.dims}")
@@ -230,10 +353,13 @@ def get_time_dimension(ds, run_date):
         logging.error(f"Error in get_time_dimension: {e}")
         raise
 
-def get_gfs_data_for_level(level):
-    """Fetches GFS data for a specific isobaric level."""
-    run_date = get_latest_gfs_run_time()
-    logging.debug(f"Selected GFS run time for level {level} Pa: {run_date}")
+def get_gfs_data_for_level(level, forecast_hour=0):
+    """Fetches GFS data for a specific isobaric level and forecast hour."""
+    run_date = get_latest_run_date()
+    init_time = run_date
+    valid_time = run_date + timedelta(hours=forecast_hour)
+
+    logging.debug(f"Fetching GFS data for level {level} Pa at +{forecast_hour}h (valid: {valid_time})")
 
     catalog_url = 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/GFS/Global_0p25deg/catalog.xml'
     cat = TDSCatalog(catalog_url)
@@ -242,29 +368,32 @@ def get_gfs_data_for_level(level):
 
     query = ncss.query()
     query.accept('netcdf4')
-    query.time(run_date)
+    query.time(valid_time)
     query.variables('Geopotential_height_isobaric',
                     'u-component_of_wind_isobaric',
                     'v-component_of_wind_isobaric',
                     'Relative_humidity_isobaric',
                     'Temperature_isobaric')
     query.vertical_level([level])
-    query.lonlat_box(north=71, south=35, east=45, west=-25) # Europe Extent
+    query.lonlat_box(north=50, south=10, east=-30, west=-100)  # Atlantic region
 
     try:
         data = ncss.get_data(query)
         ds = xr.open_dataset(xr.backends.NetCDF4DataStore(data))
         ds = ds.metpy.parse_cf()
         logging.debug(f"Available variables for level {level}: {list(ds.variables)}")
-        return ds, run_date
+        return ds, init_time, valid_time
     except Exception as e:
-        logging.error(f"Error fetching data for level {level}: {e}")
-        return None, None
+        logging.error(f"Error fetching data for level {level} at +{forecast_hour}h: {e}")
+        return None, None, None
 
-def get_gfs_surface_data():
-    """Fetches GFS surface data including temperature, surface pressure, elevation, and 10m wind components."""
-    run_date = get_latest_gfs_run_time()
-    logging.debug(f"Selected GFS run time for surface data: {run_date}")
+def get_gfs_surface_data(forecast_hour=0):
+    """Fetches GFS surface data for a given forecast hour."""
+    run_date = get_latest_run_date()
+    init_time = run_date
+    valid_time = run_date + timedelta(hours=forecast_hour)
+
+    logging.debug(f"Fetching GFS surface data at +{forecast_hour}h (valid: {valid_time})")
 
     catalog_url = 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/GFS/Global_0p25deg/catalog.xml'
     try:
@@ -274,7 +403,7 @@ def get_gfs_surface_data():
 
         query = ncss.query()
         query.accept('netcdf4')
-        query.time(run_date)
+        query.time(valid_time)
         query.variables(
             'Temperature_surface',
             'Pressure_surface',
@@ -282,10 +411,10 @@ def get_gfs_surface_data():
             'u-component_of_wind_height_above_ground',
             'v-component_of_wind_height_above_ground'
         )
-        query.lonlat_box(north=71, south=35, east=45, west=-25)  # Europe
-        query.vertical_level(10) # Request 10m wind
+        query.lonlat_box(north=50, south=10, east=-30, west=-100)
+        query.vertical_level(10)
 
-        logging.info(f"Downloading GFS surface data for {run_date}...")
+        logging.info(f"Downloading GFS surface data for +{forecast_hour}h...")
         data = ncss.get_data(query)
         ds = xr.open_dataset(xr.backends.NetCDF4DataStore(data))
         ds = ds.metpy.parse_cf()
@@ -307,14 +436,14 @@ def get_gfs_surface_data():
         logging.debug(f"Dataset dimensions: {ds.dims}")
         logging.debug(f"Available variables: {list(ds.variables)}")
 
-        return ds, run_date
+        return ds, init_time, valid_time
     except Exception as e:
-        logging.error(f"Error in get_gfs_surface_data: {e}")
-        return None, None
+        logging.error(f"Error in get_gfs_surface_data at +{forecast_hour}h: {e}")
+        return None, None, None
 
 def plot_background(ax):
     """Adds background features to the map axes."""
-    ax.set_extent([-25, 45, 35, 71], crs=ccrs.PlateCarree())  # Europe
+    ax.set_extent([-100, -30, 10, 50], crs=ccrs.PlateCarree())  # Atlantic
     ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=1.5)
     ax.add_feature(cfeature.BORDERS.with_scale('50m'), linestyle=':', linewidths=2.5, edgecolor='#750b7a')
     ax.add_feature(cfeature.STATES.with_scale('50m'), linestyle=':', linewidths=2, edgecolor='#750b7a')
@@ -335,11 +464,10 @@ def add_cities(ax):
         ax.text(city['lon'] + 0.5, city['lat'] + 0.5, city['name'], color='black', fontsize=6, transform=ccrs.PlateCarree(),
                 ha='left', va='bottom', bbox=dict(facecolor='white', edgecolor='none', alpha=0.7))
 
-def generate_map(ds, run_date, level, variable, cmap, title, cb_label, levels=None):
+def generate_map(ds, init_time, valid_time, level, variable, cmap, title, cb_label, levels=None, forecast_hour=0):
     """Generates a map for a specified isobaric level and variable."""
     try:
-        # Get the time dimension selection
-        time_dims = get_time_dimension(ds, run_date)
+        time_dims = get_time_dimension(ds, init_time)
         ds = ds.isel(**time_dims)
         
         lon = ds.get('longitude')
@@ -401,12 +529,12 @@ def generate_map(ds, run_date, level, variable, cmap, title, cb_label, levels=No
         v_wind_knots = v_wind * 1.94384
         ax.barbs(lon_2d[::5, ::5], lat_2d[::5, ::5], u_wind_knots[::5, ::5], v_wind_knots[::5, ::5], transform=crs, length=6)
 
-        ax.set_title(f"{title} {run_date.strftime('%d %B %Y %H:%MZ')}", fontsize=16)
+        ax.set_title(f"{title} | Valid: {valid_time.strftime('%d %B %Y %H:%MZ')} (+{forecast_hour}h)", fontsize=16)
         cb = fig.colorbar(cf, ax=ax, orientation='horizontal', shrink=1.0, pad=0.03, extend='both')
         cb.set_label(cb_label, size='large')
 
         plot_background(ax)
-        add_cities(ax) # Add cities to the map
+        add_cities(ax)
 
         add_logos_to_figure(fig, LOGO_PATHS, logo_size=1.0, logo_pad=0.03)
 
@@ -414,36 +542,29 @@ def generate_map(ds, run_date, level, variable, cmap, title, cb_label, levels=No
 
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
-        
-        plt.show() # <-- ADDED
+        plt.show()
         plt.close(fig)
         buf.seek(0)
 
         return buf
 
-    except ValueError as e:
-        logging.error(f"Data extraction error in generate_map: {e}", exc_info=True)
-        return None
     except Exception as e:
-        logging.error(f"An unexpected error occurred in generate_map: {e}", exc_info=True)
+        logging.error(f"Error in generate_map: {e}", exc_info=True)
         return None
 
-def generate_mslp_temp_map():
+def generate_mslp_temp_map(forecast_hour=0):
     """Generate a Mean Sea Level Pressure (MSLP) chart with temperature gradient and meteorological features."""
     try:
-        ds, run_date = get_gfs_surface_data()
+        ds, init_time, valid_time = get_gfs_surface_data(forecast_hour)
         if ds is None:
             raise ValueError("Failed to retrieve surface data.")
 
-        time_dims = get_time_dimension(ds, run_date)
+        time_dims = get_time_dimension(ds, init_time)
         ds = ds.isel(**time_dims)
 
         lon = ds.longitude.values
         lat = ds.latitude.values
         lon_2d, lat_2d = np.meshgrid(lon, lat)
-
-        logging.debug(f"Dataset dimensions: {ds.dims}")
-        logging.debug(f"Available variables: {list(ds.variables)}")
 
         temp_surface = ds["t2m"].squeeze().metpy.convert_units("degC").metpy.dequantify()
         surface_pressure = ds["sp"].squeeze().metpy.convert_units("Pa").metpy.dequantify()
@@ -451,38 +572,18 @@ def generate_mslp_temp_map():
         u_wind = ds["u10"].squeeze().metpy.dequantify()
         v_wind = ds["v10"].squeeze().metpy.dequantify()
 
-        logging.debug(f"temp_surface shape: {temp_surface.shape}, NaN count: {np.isnan(temp_surface).sum()}")
-        logging.debug(f"surface_pressure shape: {surface_pressure.shape}, NaN count: {np.isnan(surface_pressure).sum()}")
-        logging.debug(f"elevation shape: {elevation.shape}, NaN count: {np.isnan(elevation).sum()}")
-        logging.debug(f"u_wind shape: {u_wind.shape}, NaN count: {np.isnan(u_wind).sum()}")
-        logging.debug(f"v_wind shape: {v_wind.shape}, NaN count: {np.isnan(v_wind).sum()}")
-
-        if temp_surface.ndim != 2 or surface_pressure.ndim != 2 or elevation.ndim != 2 or u_wind.ndim != 2 or v_wind.ndim != 2:
-            raise ValueError(f"Data dimensions mismatch: {temp_surface.shape}, {surface_pressure.shape}, {elevation.shape}, {u_wind.shape}, {v_wind.shape}")
-
-        if np.isnan(temp_surface).all() or np.isnan(surface_pressure).all() or np.isnan(elevation).all() or np.isnan(u_wind).all() or np.isnan(v_wind).all():
-            raise ValueError("Data contains only NaN values")
-
         g = 9.80665
         Rd = 287.05
         temp_kelvin = temp_surface + 273.15
         mslp = surface_pressure * np.exp((g * elevation) / (Rd * temp_kelvin))
         mslp = mslp / 100
-        logging.debug(f"mslp shape: {mslp.shape}, NaN count: {np.isnan(mslp).sum()}")
 
         mslp = np.where((mslp >= 850) & (mslp <= 1100), mslp, np.nan)
         mslp_smooth = ndimage.gaussian_filter(mslp, sigma=3, order=0)
-        logging.debug(f"mslp_smooth shape: {mslp_smooth.shape}, NaN count: {np.isnan(mslp_smooth).sum()}")
 
         temp_grad_x, temp_grad_y = np.gradient(temp_surface, lon[1] - lon[0], lat[1] - lat[0])
         temp_grad_mag = np.sqrt(temp_grad_x**2 + temp_grad_y**2)
         frontogenesis = compute_advection(temp_grad_mag, u_wind, v_wind, lat, lon)
-        logging.debug(f"temp_grad_mag shape: {temp_grad_mag.shape}, NaN count: {np.isnan(temp_grad_mag).sum()}")
-        logging.debug(f"frontogenesis shape: {frontogenesis.shape}, NaN count: {np.isnan(frontogenesis).sum()}")
-
-        mslp_grad_x, mslp_grad_y = np.gradient(mslp_smooth, lon[1] - lon[0], lat[1] - lat[0])
-        mslp_lap = np.gradient(mslp_grad_x, axis=1) + np.gradient(mslp_grad_y, axis=0)
-        curvature = mslp_grad_x * np.gradient(mslp_grad_y, axis=0) - mslp_grad_y * np.gradient(mslp_grad_x, axis=1)
 
         crs = ccrs.PlateCarree()
         fig, ax = plt.subplots(figsize=(16, 10), subplot_kw={'projection': crs})
@@ -496,14 +597,12 @@ def generate_mslp_temp_map():
             levels=np.linspace(np.nanmin(temp_surface), np.nanmax(temp_surface), 41),
             cmap='jet', transform=crs
         )
-        logging.debug(f"Temperature contourf plotted with min: {np.nanmin(temp_surface)}, max: {np.nanmax(temp_surface)}")
 
         mslp_min = np.floor(np.nanmin(mslp) / 2) * 2
         mslp_max = np.ceil(np.nanmax(mslp) / 2) * 2
         isobar_levels = np.arange(mslp_min, mslp_max + 2, 2)
         c = ax.contour(lon_2d, lat_2d, mslp_smooth, levels=isobar_levels, colors='black', linewidths=2, transform=crs)
         ax.clabel(c, fmt='%d hPa', inline=True, fontsize=5)
-        logging.debug(f"MSLP contours plotted with levels: {isobar_levels}")
 
         u_wind_knots = u_wind * 1.94384
         v_wind_knots = v_wind * 1.94384
@@ -512,34 +611,31 @@ def generate_mslp_temp_map():
             u_wind_knots[::5, ::5], v_wind_knots[::5, ::5],
             transform=crs, length=6, color='black'
         )
-        logging.debug("Wind barbs plotted")
 
         dry_line_mask = (temp_grad_mag > np.percentile(temp_grad_mag, 90)) & (frontogenesis > -0.005) & (frontogenesis < 0.005)
         ax.contour(lon_2d, lat_2d, dry_line_mask, levels=[0.5], colors='brown', linestyles='-.', linewidths=1, transform=crs)
-        logging.debug("Dry lines plotted")
 
-        main_title = f"Europe: MSLP with Temperature Gradient (°C) and Features"
+        main_title = f"Atlantic: MSLP with Temperature Gradient (°C) and Features"
         ax.set_title(main_title, fontsize=16)
-        fig.suptitle(run_date.strftime('%d %B %Y %H:%MZ'), fontsize=12, y=1.02)
+        fig.suptitle(f"Valid: {valid_time.strftime('%d %B %Y %H:%MZ')} (+{forecast_hour}h)", fontsize=12, y=1.02)
         cb = fig.colorbar(cf, ax=ax, orientation='horizontal', shrink=1.0, pad=0.03)
         cb.set_label('Temperature (°C)', size='large')
 
         add_logos_to_figure(fig, LOGO_PATHS, logo_size=1.0, logo_pad=0.03)
-        add_cities(ax) # Add cities to the map
+        add_cities(ax)
 
         plt.subplots_adjust(left=0.01, right=0.99, top=0.90, bottom=0.05)
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
-        
-        plt.show() # <-- ADDED
+        plt.show()
         plt.close(fig)
         buf.seek(0)
 
-        return buf, run_date
+        return buf, init_time, valid_time
 
     except Exception as e:
         logging.error(f"Error in generate_mslp_temp_map: {e}", exc_info=True)
-        return None, None
+        return None, None, None
 
 def add_logos_to_figure(fig, logo_paths, logo_size=1.0, logo_pad=0.03):
     """Adds logos to the figure at the top-left and top-right positions."""
@@ -585,260 +681,266 @@ def save_map_to_disk(image_bytes, filename):
         if image_bytes:
             image_bytes.close()
 
-def run_wind300():
-    print('Generating 300 hPa wind map, please wait...')
-    image_bytes = None
+def run_wind300(forecast_hour=0):
+    print(f'Generating 300 hPa wind map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 300 hPa wind map")
-        ds, run_date = get_gfs_data_for_level(30000)
+        ds, init_time, valid_time = get_gfs_data_for_level(30000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 300 hPa wind map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 30000, 'wind_speed', 'cool', '300-hPa Wind Speeds and Heights (Europe)', 'Wind Speed (knots)'
+            ds, init_time, valid_time, 30000, 'wind_speed', 'cool', '300-hPa Wind Speeds and Heights (Atlantic)', 'Wind Speed (knots)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 300 hPa wind map due to missing or invalid data.')
             return
-        filename = f'eu_wind300_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Awind300_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 300 hPa wind map: {e}")
-        print(f'An unexpected error occurred while generating the 300 hPa wind map: {e}')
+        logging.error(f"Error generating 300 hPa wind map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_wind500():
-    print('Generating 500 hPa wind map, please wait...')
-    image_bytes = None
+def run_wind500(forecast_hour=0):
+    print(f'Generating 500 hPa wind map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 500 hPa wind map")
-        ds, run_date = get_gfs_data_for_level(50000)
+        ds, init_time, valid_time = get_gfs_data_for_level(50000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 500 hPa wind map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 50000, 'wind_speed', 'YlOrBr', '500-hPa Wind Speeds and Heights (Europe)', 'Wind Speed (knots)'
+            ds, init_time, valid_time, 50000, 'wind_speed', 'YlOrBr', '500-hPa Wind Speeds and Heights (Atlantic)', 'Wind Speed (knots)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 500 hPa wind map due to missing or invalid data.')
             return
-        filename = f'eu_wind500_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Awind500_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 500 hPa wind map: {e}")
-        print(f'An unexpected error occurred while generating the 500 hPa wind map: {e}')
+        logging.error(f"Error generating 500 hPa wind map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_vort500():
-    print('Generating 500 hPa vorticity map, please wait...')
-    image_bytes = None
+def run_vort500(forecast_hour=0):
+    print(f'Generating 500 hPa vorticity map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 500 hPa vorticity map")
-        ds, run_date = get_gfs_data_for_level(50000)
+        ds, init_time, valid_time = get_gfs_data_for_level(50000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 500 hPa vorticity map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 50000, 'vorticity', 'seismic', '500-hPa Absolute Vorticity and Heights (Europe)',
-            r'Vorticity ($10^{-5}$ s$^{-1}$)', levels=np.linspace(-20, 20, 41)
+            ds, init_time, valid_time, 50000, 'vorticity', 'seismic', '500-hPa Absolute Vorticity and Heights (Atlantic)',
+            r'Vorticity ($10^{-5}$ s$^{-1}$)', levels=np.linspace(-20, 20, 41), forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 500 hPa vorticity map due to missing or invalid data.')
             return
-        filename = f'eu_vort500_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Avort500_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 500 hPa vorticity map: {e}")
-        print(f'An unexpected error occurred while generating the 500 hPa vorticity map: {e}')
+        logging.error(f"Error generating 500 hPa vorticity map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_rh700():
-    print('Generating 700 hPa relative humidity map, please wait...')
-    image_bytes = None
+def run_rh700(forecast_hour=0):
+    print(f'Generating 700 hPa relative humidity map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 700 hPa relative humidity map")
-        ds, run_date = get_gfs_data_for_level(70000)
+        ds, init_time, valid_time = get_gfs_data_for_level(70000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 700 hPa relative humidity map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 70000, 'relative_humidity', 'BuGn', '700-hPa Relative Humidity and Heights (Europe)', 'Relative Humidity (%)'
+            ds, init_time, valid_time, 70000, 'relative_humidity', 'BuGn', '700-hPa Relative Humidity and Heights (Atlantic)', 'Relative Humidity (%)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 700 hPa relative humidity map due to missing or invalid data.')
             return
-        filename = f'eu_rh700_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Arh700_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 700 hPa relative humidity map: {e}")
-        print(f'An unexpected error occurred while generating the 700 hPa relative humidity map: {e}')
-        
-def run_fronto700():
-    print('Generating 700 hPa frontogenesis map, please wait...')
+        logging.error(f"Error generating 700 hPa relative humidity map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
+
+def run_fronto700(forecast_hour=0):
+    print(f'Generating 700 hPa frontogenesis map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 700 hPa frontogenesis map")
-        ds, run_date = get_gfs_data_for_level(70000)
+        ds, init_time, valid_time = get_gfs_data_for_level(70000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 700 hPa frontogenesis map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 70000, 'frontogenesis', 'RdBu_r', '700-hPa Frontogenesis and Heights (Europe)',
-            'Frontogenesis (K/100km/3hr)', levels=np.linspace(-10, 10, 41)
+            ds, init_time, valid_time, 70000, 'frontogenesis', 'RdBu_r', '700-hPa Frontogenesis and Heights (Atlantic)',
+            'Frontogenesis (K/100km/3hr)', levels=np.linspace(-10, 10, 41), forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 700 hPa frontogenesis map due to missing or invalid data.')
             return
-        filename = f'eu_fronto700_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Afronto700_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error in run_fronto700: {e}")
+        logging.error(f"Error in run_fronto700 at +{forecast_hour}h: {e}")
         print(f'An unexpected error occurred: {e}')
 
-def run_wind850():
-    print('Generating 850 hPa wind map, please wait...')
-    image_bytes = None
+def run_wind850(forecast_hour=0):
+    print(f'Generating 850 hPa wind map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 850 hPa wind map")
-        ds, run_date = get_gfs_data_for_level(85000)
+        ds, init_time, valid_time = get_gfs_data_for_level(85000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 850 hPa wind map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 85000, 'wind_speed', 'YlOrBr', '850-hPa Wind Speeds and Heights (Europe)', 'Wind Speed (knots)'
+            ds, init_time, valid_time, 85000, 'wind_speed', 'YlOrBr', '850-hPa Wind Speeds and Heights (Atlantic)', 'Wind Speed (knots)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 850 hPa wind map due to missing or invalid data.')
             return
-        filename = f'eu_wind850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Awind850_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 850 hPa wind map: {e}")
-        print(f'An unexpected error occurred while generating the 850 hPa wind map: {e}')
+        logging.error(f"Error generating 850 hPa wind map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_dew850():
-    print('Generating 850 hPa dewpoint map, please wait...')
-    image_bytes = None
+def run_dew850(forecast_hour=0):
+    print(f'Generating 850 hPa dewpoint map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 850 hPa dewpoint map")
-        ds, run_date = get_gfs_data_for_level(85000)
+        ds, init_time, valid_time = get_gfs_data_for_level(85000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 850 hPa dewpoint map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 85000, 'dewpoint', 'BuGn', '850-hPa Dewpoint (°C) (Europe)', 'Dewpoint (°C)'
+            ds, init_time, valid_time, 85000, 'dewpoint', 'BuGn', '850-hPa Dewpoint (°C) (Atlantic)', 'Dewpoint (°C)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 850 hPa dewpoint map due to missing or invalid data.')
             return
-        filename = f'eu_dew850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Adew850_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 850 hPa dewpoint map: {e}")
-        print(f'An unexpected error occurred while generating the 850 hPa dewpoint map: {e}')
+        logging.error(f"Error generating 850 hPa dewpoint map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_mAdv850():
-    print('Generating 850 hPa moisture advection map, please wait...')
-    image_bytes = None
+def run_mAdv850(forecast_hour=0):
+    print(f'Generating 850 hPa moisture advection map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 850 hPa moisture advection map")
-        ds, run_date = get_gfs_data_for_level(85000)
+        ds, init_time, valid_time = get_gfs_data_for_level(85000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 850 hPa moisture advection map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 85000, 'moisture_advection', 'PRGn', '850-hPa Moisture Advection (Europe)', 'Moisture Advection (%/hour)'
+            ds, init_time, valid_time, 85000, 'moisture_advection', 'PRGn', '850-hPa Moisture Advection (Atlantic)', 'Moisture Advection (%/hour)',
+            forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 850 hPa moisture advection map due to missing or invalid data.')
             return
-        filename = f'eu_mAdv850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'AmAdv850_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 850 hPa moisture advection map: {e}")
-        print(f'An unexpected error occurred while generating the 850 hPa moisture advection map: {e}')
+        logging.error(f"Error generating 850 hPa moisture advection map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_tAdv850():
-    print('Generating 850 hPa temperature advection map, please wait...')
-    image_bytes = None
+def run_tAdv850(forecast_hour=0):
+    print(f'Generating 850 hPa temperature advection map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 850 hPa temperature advection map")
-        ds, run_date = get_gfs_data_for_level(85000)
+        ds, init_time, valid_time = get_gfs_data_for_level(85000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 850 hPa temperature advection map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 85000, 'temp_advection', 'coolwarm', '850-hPa Temperature Advection (Europe)', 'Temperature Advection (K/hour)',
-            levels=np.linspace(-20, 20, 41)
+            ds, init_time, valid_time, 85000, 'temp_advection', 'coolwarm', '850-hPa Temperature Advection (Atlantic)', 'Temperature Advection (K/hour)',
+            levels=np.linspace(-20, 20, 41), forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 850 hPa temperature advection map due to missing or invalid data.')
             return
-        filename = f'eu_tAdv850_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'AtAdv850_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 850 hPa temperature advection map: {e}")
-        print(f'An unexpected error occurred while generating the 850 hPa temperature advection map: {e}')
+        logging.error(f"Error generating 850 hPa temperature advection map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_mslp_temp():
-    print('Generating MSLP with temperature gradient map, please wait...')
-    image_bytes = None
+def run_mslp_temp(forecast_hour=0):
+    print(f'Generating MSLP with temperature gradient map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for MSLP with temperature gradient map")
-        image_bytes, run_date = generate_mslp_temp_map()
-        if image_bytes is None or run_date is None:
-            print('Failed to generate the MSLP with temperature gradient map due to missing or invalid data.')
+        logging.info(f"Fetching data for MSLP with temperature gradient map at +{forecast_hour}h")
+        image_bytes, init_time, valid_time = generate_mslp_temp_map(forecast_hour)
+        if image_bytes is None:
+            print("Failed to generate the map due to an error in data processing.")
             return
-        filename = f'eu_mslp_temp_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Amslp_temp_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating MSLP with temperature gradient map: {e}")
-        print(f'An unexpected error occurred while generating the MSLP with temperature gradient map: {e}')
+        logging.error(f"Error generating MSLP with temperature gradient map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-def run_divcon300():
-    print('Generating 300 hPa divergence map, please wait...')
-    image_bytes = None
+def run_divcon300(forecast_hour=0):
+    print(f'Generating 300 hPa divergence map for +{forecast_hour}h, please wait...')
     try:
-        logging.info("Fetching data for 300 hPa divergence/convergence map")
-        ds, run_date = get_gfs_data_for_level(30000)
+        logging.info(f"Fetching data for 300 hPa divergence/convergence map at +{forecast_hour}h")
+        ds, init_time, valid_time = get_gfs_data_for_level(30000, forecast_hour)
         if ds is None:
             print('Failed to retrieve data for the 300 hPa divergence/convergence map.')
             return
         image_bytes = generate_map(
-            ds, run_date, 30000, 'divergence', 'RdBu_r',
-            '300-hPa Divergence/Convergence (Europe)', 'Divergence (10^5 s^-1)'
+            ds, init_time, valid_time, 30000, 'divergence', 'RdBu_r',
+            '300-hPa Divergence/Convergence (Atlantic)', r'Divergence ($10^{-5}$ s$^{-1}$)',
+            levels=np.linspace(-40, 40, 41), forecast_hour=forecast_hour
         )
         if image_bytes is None:
             print('Failed to generate the 300 hPa divergence/convergence map due to missing or invalid data.')
             return
-        filename = f'eu_divcon300_{run_date.strftime("%Y%m%d_%H%MZ")}.png'
+        filename = f'Adivcon300_{valid_time.strftime("%Y%m%d_%H%MZ")}_f{forecast_hour:03d}.png'
         save_map_to_disk(image_bytes, filename)
     except Exception as e:
-        logging.error(f"Error generating 300 hPa divergence/convergence map: {e}")
-        print(f'An unexpected error occurred while generating the 300 hPa divergence/convergence map: {e}')
+        logging.error(f"Error generating 300 hPa divergence/convergence map at +{forecast_hour}h: {e}")
+        print(f'An unexpected error occurred: {e}')
 
-# Main execution block
+# Section 7: Main execution block
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate meteorological maps for the European region.",
+        description="Generate meteorological maps for the Atlantic region.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     
-    # Use subparsers to mimic Discord commands
-    subparsers = parser.add_subparsers(dest='command', required=True, help='The map to generate. Example: python eu_weather_maps.py wind300')
+    subparsers = parser.add_subparsers(dest='command', required=True, help='The map to generate. Example: python atl_weather_maps.py mslp_temp 12')
 
-    # Create a parser for each command
-    subparsers.add_parser('wind300', help='300 hPa Wind Speed and Heights')
-    subparsers.add_parser('wind500', help='500 hPa Wind Speed and Heights')
-    subparsers.add_parser('vort500', help='500 hPa Absolute Vorticity')
-    subparsers.add_parser('rh700', help='700 hPa Relative Humidity')
-    subparsers.add_parser('fronto700', help='700 hPa Frontogenesis')
-    subparsers.add_parser('wind850', help='850 hPa Wind Speed')
-    subparsers.add_parser('dew850', help='850 hPa Dewpoint')
-    subparsers.add_parser('mAdv850', help='850 hPa Moisture Advection')
-    subparsers.add_parser('tAdv850', help='850 hPa Temperature Advection')
-    subparsers.add_parser('mslp_temp', help='MSLP, 2m Temp, and 10m Wind')
-    subparsers.add_parser('divcon300', help='300 hPa Divergence/Convergence')
+    cmd_wind300 = subparsers.add_parser('wind300', help='300 hPa Wind Speed and Heights')
+    cmd_wind300.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_wind500 = subparsers.add_parser('wind500', help='500 hPa Wind Speed and Heights')
+    cmd_wind500.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_vort500 = subparsers.add_parser('vort500', help='500 hPa Absolute Vorticity')
+    cmd_vort500.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_rh700 = subparsers.add_parser('rh700', help='700 hPa Relative Humidity')
+    cmd_rh700.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_fronto700 = subparsers.add_parser('fronto700', help='700 hPa Frontogenesis')
+    cmd_fronto700.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_wind850 = subparsers.add_parser('wind850', help='850 hPa Wind Speed')
+    cmd_wind850.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_dew850 = subparsers.add_parser('dew850', help='850 hPa Dewpoint')
+    cmd_dew850.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_mAdv850 = subparsers.add_parser('mAdv850', help='850 hPa Moisture Advection')
+    cmd_mAdv850.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_tAdv850 = subparsers.add_parser('tAdv850', help='850 hPa Temperature Advection')
+    cmd_tAdv850.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_mslp_temp = subparsers.add_parser('mslp_temp', help='MSLP, 2m Temp, 10m Wind, and Fronts')
+    cmd_mslp_temp.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
+
+    cmd_divcon300 = subparsers.add_parser('divcon300', help='300 hPa Divergence/Convergence')
+    cmd_divcon300.add_argument('forecast_hour', type=int, nargs='?', default=0, help='Forecast hour (0-384, default: 0)')
     
     args = parser.parse_args()
 
-    # A simple mapping to call the correct function
     command_functions = {
         'wind300': run_wind300,
         'wind500': run_wind500,
@@ -853,18 +955,16 @@ def main():
         'divcon300': run_divcon300,
     }
     
-    # Get the function from the map and run it
     func_to_run = command_functions.get(args.command)
     
     if func_to_run:
         try:
-            func_to_run()
+            func_to_run(args.forecast_hour)
         except Exception as e:
             logging.error(f"A critical error occurred while running {args.command}: {e}", exc_info=True)
             print(f"A critical error occurred: {e}")
             sys.exit(1)
     else:
-        # This case should be unreachable due to `required=True` in subparsers
         print(f"Unknown command: {args.command}")
         parser.print_help()
         sys.exit(1)
