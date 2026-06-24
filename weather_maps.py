@@ -4,7 +4,8 @@
 Advanced CONUS Weather Map Generator
 Surface Maps: Blended HRRR/RAP/RTMA with explicit high-terrain hypsometric reduction.
 Upper Air Maps: Blended RAP (13km) + GFS (0.25deg) Isobaric Data.
-Includes universal 4 dam upper-air intervals, dynamic colorbar locators, and optimized wind barbs.
+Includes universal 4 dam upper-air intervals, dynamic colorbar locators, optimized wind barbs,
+and tiered surface dew point contours.
 """
 
 import logging
@@ -20,6 +21,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.patheffects as pe
 import matplotlib.ticker as ticker
 import cartopy.crs as ccrs
@@ -210,9 +212,10 @@ def fetch_rap_full(extent):
             return None
 
         temp_var = find_var(['Temperature_height_above_ground', 'Temperature_surface', 'tmp2m'])
+        dp_var = find_var(['Dewpoint_temperature_height_above_ground', 'Dewpoint_temperature_surface', 'dpt2m'])
         u_var = find_var(['u-component_of_wind_height_above_ground', 'u-component_of_wind_surface'])
         v_var = find_var(['v-component_of_wind_height_above_ground', 'v-component_of_wind_surface'])
-        sfc_press_var = find_var(['Pressure_surface', 'pressure_surface', 'pres_sfc'])
+        sfc_press_var = find_var(['MSLP_MAPS_System_Reduction_msl', 'Pressure_reduced_to_MSL_msl'])
         orog_var = find_var(['Geopotential_height_surface', 'orography', 'HGT_surface'])
 
         query = ncss.query()
@@ -220,7 +223,7 @@ def fetch_rap_full(extent):
         query.accept('netcdf4')
         query.add_lonlat(True)
         
-        vars_to_fetch = [v for v in [temp_var, u_var, v_var, sfc_press_var, orog_var] if v]
+        vars_to_fetch = [v for v in [temp_var, dp_var, u_var, v_var, sfc_press_var, orog_var] if v]
         query.variables(*vars_to_fetch)
         data = ncss.get_data(query)
         
@@ -233,14 +236,16 @@ def fetch_rap_full(extent):
             return val
 
         t_k = get_val(temp_var)
+        dp_k = get_val(dp_var) if dp_var else np.full_like(t_k, np.nan)
         p_sfc = get_val(sfc_press_var)
         elev = get_val(orog_var) if orog_var else np.zeros_like(t_k)
         
-        calculated_mslp = calculate_adjusted_mslp(p_sfc, t_k, elev) / 100.0
+        calculated_mslp = (p_sfc / 100.0) if sfc_press_var else np.zeros_like(t_k)
 
         return {
             'lat': data.variables[lat_var][:], 'lon': data.variables[lon_var][:],
             'temp': (t_k - 273.15) * 9/5 + 32,
+            'dewpoint': (dp_k - 273.15) * 9/5 + 32,
             'u': get_val(u_var) * 1.94384, 'v': get_val(v_var) * 1.94384,
             'pressure': calculated_mslp
         }
@@ -248,6 +253,27 @@ def fetch_rap_full(extent):
         logging.error(f"RAP Surface Fetch Failed: {e}")
         return None
 
+def fetch_goes_ch9():
+    """Fetches real GOES-16 Ch 9 Water Vapor for the background overlay."""
+    logging.info("Fetching real GOES-16 Ch 9 Water Vapor for background overlay...")
+    try:
+        import metpy
+        cat = TDSCatalog('https://thredds.ucar.edu/thredds/catalog/satellite/goes/east/products/CloudAndMoistureImagery/CONUS/Channel09/current/catalog.xml')
+        datasets = sorted(list(cat.datasets.values()), key=lambda d: d.name)
+        latest_url = datasets[-1].access_urls['OPeNDAP']
+        
+        ds = xr.open_dataset(latest_url)
+        ds = ds.metpy.parse_cf()
+        var = ds['Sectorized_CMI'] if 'Sectorized_CMI' in ds else ds['CMI']
+        logging.info("✅ GOES-16 Data Fetched Successfully.")
+        return ds, var
+    except ImportError:
+        logging.error("MetPy is required for real GOES overlays. Run: pip install metpy")
+        return None, None
+    except Exception as e:
+        logging.error(f"Failed to fetch GOES data: {e}")
+        return None, None
+    
 def fetch_hrrr_sfc(extent):
     logging.info("Fetching HRRR Surface Data & Surface Pressure...")
     try:
@@ -264,9 +290,10 @@ def fetch_hrrr_sfc(extent):
             return None
 
         t_var = find(['Temperature_height_above_ground', 'Temperature_surface'])
+        dp_var = find(['Dewpoint_temperature_height_above_ground', 'Dewpoint_temperature_surface'])
         u_var = find(['u-component_of_wind_height_above_ground', 'u-component_of_wind_surface'])
         v_var = find(['v-component_of_wind_height_above_ground', 'v-component_of_wind_surface'])
-        sfc_p_var = find(['Pressure_surface', 'pres_sfc'])
+        sfc_p_var = find(['MSLP_MAPS_System_Reduction_msl', 'Pressure_reduced_to_MSL_msl'])
         orog_var = find(['Geopotential_height_surface', 'HGT_surface'])
 
         query = ncss.query()
@@ -274,7 +301,7 @@ def fetch_hrrr_sfc(extent):
         query.accept('netcdf4')
         query.add_lonlat(True)
         
-        valid_vars = [v for v in [t_var, u_var, v_var, sfc_p_var, orog_var] if v]
+        valid_vars = [v for v in [t_var, dp_var, u_var, v_var, sfc_p_var, orog_var] if v]
         query.variables(*valid_vars)
         data = ncss.get_data(query)
         
@@ -288,14 +315,16 @@ def fetch_hrrr_sfc(extent):
             return val
 
         t_k = get(t_var)
+        dp_k = get(dp_var) if dp_var else np.full_like(t_k, np.nan)
         p_sfc = get(sfc_p_var)
         elev = get(orog_var) if orog_var else np.zeros_like(t_k)
         
-        calculated_mslp = calculate_adjusted_mslp(p_sfc, t_k, elev) / 100.0
+        calculated_mslp = p_sfc / 100.0
 
         return {
             'lat': data.variables[lat_var][:], 'lon': data.variables[lon_var][:],
             'temp': (t_k - 273.15) * 9/5 + 32,
+            'dewpoint': (dp_k - 273.15) * 9/5 + 32,
             'u': get(u_var) * 1.94384, 'v': get(v_var) * 1.94384,
             'pressure': calculated_mslp
         }
@@ -325,9 +354,10 @@ def fetch_rtma_sfc(extent):
             return fallback
 
         t_var = get_best_match(['Temperature_height_above_ground', 'Temperature_surface', 'tmp2m'], 'Temperature_height_above_ground')
+        dp_var = get_best_match(['Dewpoint_temperature_height_above_ground', 'Dewpoint_temperature_surface', 'dpt2m'], 'Dewpoint_temperature_height_above_ground')
         u_var = get_best_match(['u-component_of_wind_height_above_ground', 'u-component_of_wind_surface'], 'u-component_of_wind_height_above_ground')
         v_var = get_best_match(['v-component_of_wind_height_above_ground', 'v-component_of_wind_surface'], 'v-component_of_wind_height_above_ground')
-        sfc_p_var = get_best_match(['Pressure_surface', 'MSL_pressure_surface', 'MSLP_MAPS_System_Reduction_msl'], 'Pressure_surface')
+        sfc_p_var = get_best_match(['MSLP_MAPS_System_Reduction_msl', 'Pressure_reduced_to_MSL_msl'], None)
         orog_var = get_best_match(['Geopotential_height_surface', 'HGT_surface'], 'Geopotential_height_surface')
 
         query = ncss.query()
@@ -335,7 +365,7 @@ def fetch_rtma_sfc(extent):
         query.accept('netcdf4')
         query.add_lonlat(True)
         
-        valid_vars = [v for v in [t_var, u_var, v_var, sfc_p_var, orog_var] if v]
+        valid_vars = [v for v in [t_var, dp_var, u_var, v_var, sfc_p_var, orog_var] if v]
         query.variables(*valid_vars)
         data = ncss.get_data(query)
         
@@ -349,14 +379,16 @@ def fetch_rtma_sfc(extent):
             return val
 
         t_k = get(t_var)
+        dp_k = get(dp_var) if dp_var else np.full_like(t_k, np.nan)
         p_sfc = get(sfc_p_var)
         elev = get(orog_var) if orog_var else np.zeros_like(t_k)
         
-        calculated_mslp = calculate_adjusted_mslp(p_sfc, t_k, elev) / 100.0
+        calculated_mslp = p_sfc / 100.0
 
         return {
             'lat': data.variables[lat_var][:], 'lon': data.variables[lon_var][:],
             'temp': (t_k - 273.15) * 9/5 + 32,
+            'dewpoint': (dp_k - 273.15) * 9/5 + 32,
             'u': get(u_var) * 1.94384, 'v': get(v_var) * 1.94384,
             'pressure': calculated_mslp
         }
@@ -364,20 +396,10 @@ def fetch_rtma_sfc(extent):
         logging.error(f"RTMA Fetch Failed: {e}")
         return None
 
-# --- NEW: UNIFIED UPPER AIR ISO-LEVEL FETCHER (RAP + GFS) ---
-def fetch_upper_air_model(model_name, level):
-    logging.info(f"Fetching {model_name} isobaric data for {level} Pa...")
-    catalogs = {
-        'RAP': 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/RAP/CONUS_13km/latest.xml',
-        'GFS': 'https://thredds.ucar.edu/thredds/catalog/grib/NCEP/GFS/CONUS_0p25/latest.xml'
-    }
-    
-    if model_name not in catalogs:
-        logging.error(f"Model {model_name} not supported.")
-        return None
-
+def fetch_upper_air_model(level):
+    logging.info(f"Fetching RAP isobaric data for {level} Pa...")
     try:
-        cat = TDSCatalog(catalogs[model_name])
+        cat = TDSCatalog('https://thredds.ucar.edu/thredds/catalog/grib/NCEP/RAP/CONUS_13km/latest.xml')
         ds = cat.datasets[0].subset()
         query = ds.query()
         query.lonlat_box(north=55, south=15, east=-60, west=-130)
@@ -389,27 +411,34 @@ def fetch_upper_air_model(model_name, level):
         
         data = ds.get_data(query)
         
-        # Helper to safely extract squeezed arrays
-        def get_var(name):
-            try:
-                var = data.variables[name][:].squeeze()
-                # Ensure 2D arrays if single timestep exists
-                if var.ndim == 3: var = var[0]
-                return var
-            except Exception:
-                return None
+        def get_var(name, fallbacks=None):
+            if fallbacks is None:
+                fallbacks = []
+            for n in [name] + fallbacks:
+                try:
+                    var = data.variables[n][:].squeeze()
+                    if var.ndim == 3:
+                        var = var[0]
+                    return var
+                except:
+                    continue
+            return None
 
-        return {
-            'lat': get_var('lat'),
-            'lon': get_var('lon'),
+        result = {
+            'lat': get_var('lat', ['latitude']),
+            'lon': get_var('lon', ['longitude']),
             'hgt': get_var('Geopotential_height_isobaric'),
             'u': get_var('u-component_of_wind_isobaric'),
             'v': get_var('v-component_of_wind_isobaric'),
             'temp': get_var('Temperature_isobaric'),
             'rh': get_var('Relative_humidity_isobaric')
         }
+        
+        logging.info(f"✅ Successfully fetched RAP at {level} Pa")
+        return result
+
     except Exception as e:
-        logging.error(f"Fetch failed for {model_name} at {level} Pa: {e}")
+        logging.error(f"RAP fetch failed at {level} Pa: {e}")
         return None
 
 # ====================================================================
@@ -417,120 +446,160 @@ def fetch_upper_air_model(model_name, level):
 # ====================================================================
 
 def blend_surface_models(rap_data, hrrr_data, rtma_data, extent):
-    logging.info("Blending Unified High-Terrain Surface Models (RAP/HRRR/RTMA)...")
+    from scipy.spatial import cKDTree
+    logging.info("Blending Unified Surface Models (KDTree Spatial Masking)...")
+    
     grid_lon = np.arange(extent[0]-0.5, extent[1]+0.5, 0.1)
     grid_lat = np.arange(extent[2]-0.5, extent[3]+0.5, 0.1)
     grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
     
-    points, temps, us, vs, press = [], [], [], [], []
+    # Flattened grid coordinates for KDTree spatial querying
+    grid_points_flat = np.column_stack((grid_x.ravel(), grid_y.ravel()))
+    
+    pts_t, vals_t = [], []
+    pts_dp, vals_dp = [], []
+    pts_wind, vals_u, vals_v = [], [], []
+    pts_p, vals_p = [], []
     
     def add_to_blend(data_dict, step):
         if not data_dict: return
         
-        lon_arr = data_dict['lon'][::step, ::step].flatten()
-        lat_arr = data_dict['lat'][::step, ::step].flatten()
-        t_arr = data_dict['temp'][::step, ::step].flatten()
-        u_arr = data_dict['u'][::step, ::step].flatten()
-        v_arr = data_dict['v'][::step, ::step].flatten()
+        lon = data_dict['lon'][::step, ::step].flatten()
+        lat = data_dict['lat'][::step, ::step].flatten()
+        lon = np.where(lon > 180, lon - 360, lon)
         
-        has_p = data_dict.get('pressure') is not None
-        
-        t_clean = np.ma.filled(t_arr, np.nan)
-        u_clean = np.ma.filled(u_arr, np.nan)
-        v_clean = np.ma.filled(v_arr, np.nan)
-        
-        valid = (~np.isnan(t_clean)) & (t_clean > -100) & (t_clean < 150)
-        valid &= (~np.isnan(u_clean)) & (np.abs(u_clean) < 200)
-        valid &= (~np.isnan(v_clean)) & (np.abs(v_clean) < 200)
-        
-        if has_p:
-            p_arr = data_dict['pressure'][::step, ::step].flatten()
-            p_clean = np.ma.filled(p_arr, np.nan)
-            valid &= (~np.isnan(p_clean)) & (p_clean > 800) & (p_clean < 1150)
+        def extract(var_name, vmin, vmax):
+            if data_dict.get(var_name) is None: return None, None
+            arr = np.ma.filled(data_dict[var_name][::step, ::step].flatten(), np.nan)
+            valid = (~np.isnan(arr)) & (arr > vmin) & (arr < vmax)
+            if not np.any(valid): return None, None
+            return np.column_stack((lon[valid], lat[valid])), arr[valid]
+
+        p_t, v_t = extract('temp', -100, 150)
+        if p_t is not None:
+            pts_t.append(p_t)
+            vals_t.append(v_t)
             
-        lon_arr = np.where(lon_arr > 180, lon_arr - 360, lon_arr)
-        
-        points.append(np.column_stack((lon_arr[valid], lat_arr[valid])))
-        temps.append(t_clean[valid])
-        us.append(u_clean[valid])
-        vs.append(v_clean[valid])
-        if has_p:
-            press.append(p_clean[valid])
+        p_dp, v_dp = extract('dewpoint', -100, 150)
+        if p_dp is not None:
+            pts_dp.append(p_dp)
+            vals_dp.append(v_dp)
+            
+        p_p, v_p = extract('pressure', 800, 1150)
+        if p_p is not None:
+            pts_p.append(p_p)
+            vals_p.append(v_p)
+            
+        if data_dict.get('u') is not None and data_dict.get('v') is not None:
+            u_arr = np.ma.filled(data_dict['u'][::step, ::step].flatten(), np.nan)
+            v_arr = np.ma.filled(data_dict['v'][::step, ::step].flatten(), np.nan)
+            valid_w = (~np.isnan(u_arr)) & (np.abs(u_arr) < 200) & (~np.isnan(v_arr)) & (np.abs(v_arr) < 200)
+            if np.any(valid_w):
+                pts_wind.append(np.column_stack((lon[valid_w], lat[valid_w])))
+                vals_u.append(u_arr[valid_w])
+                vals_v.append(v_arr[valid_w])
 
     add_to_blend(rap_data, 1)
     add_to_blend(hrrr_data, 3)
     add_to_blend(rtma_data, 3)
 
-    if not points: return None, None, None, None, None, None
-
-    all_points = np.vstack(points)
-    all_temps = np.concatenate(temps)
-    all_us = np.concatenate(us)
-    all_vs = np.concatenate(vs)
-    all_press = np.concatenate(press) if press else None
-    
-    def interp_safe(vals, sigma=1.0):
-        res = griddata(all_points, vals, (grid_x, grid_y), method='linear')
-        mask_nan = np.isnan(res)
-        if np.any(mask_nan):
-            res[mask_nan] = griddata(all_points, vals, (grid_x[mask_nan], grid_y[mask_nan]), method='nearest')
-        return gaussian_filter(res, sigma=sigma) 
+    def interp_var(pts_list, vals_list, sigma=1.0, mask_extrapolated=True):
+        if not pts_list: return None
+        pts = np.vstack(pts_list)
+        vals = np.concatenate(vals_list)
+        
+        # 1. Standard linear interpolation (creates the bad convex hull bridge)
+        res = griddata(pts, vals, (grid_x, grid_y), method='linear')
+        
+        if mask_extrapolated:
+            # 2. Build a spatial tree of the actual valid data points
+            tree = cKDTree(pts)
+            # 3. Query the distance from every map pixel to the nearest real data point
+            dists, _ = tree.query(grid_points_flat)
+            dists = dists.reshape(grid_x.shape)
+            
+            # 4. If a pixel is more than 0.3 degrees (~30km) from a real point, kill it.
+            # This instantly severs the convex hull bridge across the Gulf/Mexico.
+            res[dists > 0.3] = np.nan
+            
+            mask_nan = np.isnan(res)
+            if np.any(mask_nan):
+                # Safe blur technique so the edges don't shrink
+                nearest_fill = griddata(pts, vals, (grid_x[mask_nan], grid_y[mask_nan]), method='nearest')
+                temp_fill = np.copy(res)
+                temp_fill[mask_nan] = nearest_fill
+                
+                smoothed = gaussian_filter(temp_fill, sigma=sigma)
+                smoothed[mask_nan] = np.nan # Re-apply the strict KDTree mask
+                return smoothed
+            return gaussian_filter(res, sigma=sigma)
+        else:
+            # Temperature bypasses the KDTree so it seamlessly fills the map background
+            mask_nan = np.isnan(res)
+            if np.any(mask_nan):
+                nearest_fill = griddata(pts, vals, (grid_x[mask_nan], grid_y[mask_nan]), method='nearest')
+                res[mask_nan] = nearest_fill
+            return gaussian_filter(res, sigma=sigma)
 
     try:
-        g_temp = interp_safe(all_temps, sigma=1.0)
-        g_u = interp_safe(all_us, sigma=1.0)
-        g_v = interp_safe(all_vs, sigma=1.0)
-        g_p = interp_safe(all_press, sigma=4.0) if all_press is not None else None
+        g_temp = interp_var(pts_t, vals_t, sigma=1.0, mask_extrapolated=False)
+        g_dp = interp_var(pts_dp, vals_dp, sigma=1.0, mask_extrapolated=True)
+        g_p = interp_var(pts_p, vals_p, sigma=4.0, mask_extrapolated=True)
         
-        return grid_y, grid_x, g_temp, g_u, g_v, g_p
+        g_u, g_v = None, None
+        if pts_wind:
+            g_u = interp_var(pts_wind, vals_u, sigma=1.0, mask_extrapolated=True)
+            g_v = interp_var(pts_wind, vals_v, sigma=1.0, mask_extrapolated=True)
+            
+        return grid_y, grid_x, g_temp, g_dp, g_u, g_v, g_p
     except Exception as e:
         logging.error(f"Blending failed: {e}")
-        return None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
-# --- NEW: UNIFIED UPPER AIR BLENDER (RAP + GFS) ---
-def blend_upper_air_models(data_list, extent):
-    logging.info("Blending Upper-Air Models...")
+def blend_upper_air_models(level, extent):
+    """RAP only."""
+    logging.info("Fetching and processing RAP Upper-Air data...")
+    rap = fetch_upper_air_model(level)
+    
+    if not rap or rap.get('hgt') is None:
+        logging.error("No valid RAP upper-air data available")
+        return None, None, None, None, None, None, None
+    
     grid_lon = np.arange(extent[0]-0.5, extent[1]+0.5, 0.1)
     grid_lat = np.arange(extent[2]-0.5, extent[3]+0.5, 0.1)
     grid_x, grid_y = np.meshgrid(grid_lon, grid_lat)
     
-    pts, hgts, us, vs, temps, rhs = [], [], [], [], [], []
-    
-    for d in data_list:
-        if not d or d['hgt'] is None: continue
-        
-        lon = np.where(d['lon'] > 180, d['lon'] - 360, d['lon']).flatten()
-        lat = d['lat'].flatten()
-        
-        # Validate grid points
-        valid = (~np.isnan(d['hgt'].flatten())) & (~np.isnan(d['temp'].flatten()))
-        
-        pts.append(np.column_stack((lon[valid], lat[valid])))
-        hgts.append(d['hgt'].flatten()[valid])
-        us.append(d['u'].flatten()[valid])
-        vs.append(d['v'].flatten()[valid])
-        temps.append(d['temp'].flatten()[valid])
-        
-        if d['rh'] is not None: rhs.append(d['rh'].flatten()[valid])
-        else: rhs.append(np.zeros_like(d['hgt'].flatten()[valid])) # safety fallback
-        
-    if not pts: return None, None, None, None, None, None, None
-    
-    all_pts = np.vstack(pts)
-    
-    def interp(vals, sigma=1.5):
-        res = griddata(all_pts, np.concatenate(vals), (grid_x, grid_y), method='linear')
-        mask = np.isnan(res)
-        if np.any(mask):
-            res[mask] = griddata(all_pts, np.concatenate(vals), (grid_x[mask], grid_y[mask]), method='nearest')
-        return gaussian_filter(res, sigma=sigma)
-        
     try:
+        lon = np.where(rap['lon'] > 180, rap['lon'] - 360, rap['lon']).flatten()
+        lat = rap['lat'].flatten()
+        
+        valid = (~np.isnan(rap['hgt'].flatten())) & (~np.isnan(rap['temp'].flatten()))
+        
+        if not np.any(valid):
+            logging.error("No valid points in RAP data")
+            return None, None, None, None, None, None, None
+        
+        pts = np.column_stack((lon[valid], lat[valid]))
+        hgts = rap['hgt'].flatten()[valid]
+        us = rap['u'].flatten()[valid]
+        vs = rap['v'].flatten()[valid]
+        temps = rap['temp'].flatten()[valid]
+        rhs = rap['rh'].flatten()[valid] if rap.get('rh') is not None else np.zeros_like(hgts)
+        
+        def interp(vals, sigma=1.5):
+            res = griddata(pts, vals, (grid_x, grid_y), method='linear')
+            mask = np.isnan(res)
+            if np.any(mask):
+                res[mask] = griddata(pts, vals, (grid_x[mask], grid_y[mask]), method='nearest')
+            return gaussian_filter(res, sigma=sigma)
+        
+        logging.info("RAP upper-air data processed successfully")
         return grid_x, grid_y, interp(hgts, 2.0), interp(us), interp(vs), interp(temps), interp(rhs)
+        
     except Exception as e:
-        logging.error(f"Upper-Air Blending failed: {e}")
+        logging.error(f"RAP Upper-Air processing failed: {e}")
         return None, None, None, None, None, None, None
-
+    
 # ==========================================
 # --- NAVY / MARINE MODULE ---
 # ==========================================
@@ -549,176 +618,199 @@ def calc_marine_physics(water_temp_k, water_u, water_v, air_temp_f, air_dew_f, w
     
     return vorticity, flux_potential, water_c
 
-
 def fetch_ocean_currents(extent):
     import netCDF4 as nc
-    print("\n--- MARINE DATA FETCH (RTOFS Direct Download) ---")
+    import time
+    print("\n--- MARINE DATA FETCH (RTOFS Direct Download with Cache) ---")
     logging.info("Attempting to fetch RTOFS data via direct HTTPS...")
 
-    today = datetime.now(timezone.utc)
-    dates_to_try = [today, today - timedelta(days=1), today - timedelta(days=2)]
-    
-    session = requests.Session()
-    session.headers.update({'User-Agent': 'Mozilla/5.0 Frostbyte/1.0'})
+    cache_dir = "cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    temp_file = os.path.join(cache_dir, "rtofs_today.nc")
+    download_needed = True
 
-    files_to_try = [
-        "rtofs_glo_2ds_f000_prog.nc", 
-        "rtofs_glo_2ds_f024_prog.nc", 
-        "rtofs_glo_2ds.f000.nc",       
-        "rtofs_glo_2ds.f024.nc"        
-    ]
+    if os.path.exists(temp_file):
+        file_age = time.time() - os.path.getmtime(temp_file)
+        file_size = os.path.getsize(temp_file)
+        
+        if file_age < 43200 and file_size > 10000000:
+            print(f"• Found valid cached RTOFS data ({int(file_age/60)} mins old). Skipping download.", flush=True)
+            download_needed = False
+        else:
+            print("• Cached file is old or corrupted. Redownloading...", flush=True)
+            try: os.remove(temp_file)
+            except: pass
 
-    temp_file = "rtofs_temp.nc"
+    if download_needed:
+        today = datetime.now(timezone.utc)
+        dates_to_try = [today, today - timedelta(days=1), today - timedelta(days=2)]
+        
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0 Frostbyte/1.0'})
 
-    for date_obj in dates_to_try:
-        date_str = date_obj.strftime('%Y%m%d')
-        base_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtofs/prod/rtofs.{date_str}"
+        files_to_try = [
+            "rtofs_glo_2ds_f000_prog.nc", 
+            "rtofs_glo_2ds_f024_prog.nc", 
+            "rtofs_glo_2ds.f000.nc",       
+            "rtofs_glo_2ds.f024.nc"        
+        ]
 
-        for filename in files_to_try:
-            url = f"{base_url}/{filename}"
-            print(f"• Trying {filename} for {date_str}...", end=" ", flush=True)
+        success = False
+        for date_obj in dates_to_try:
+            if success: break
+            date_str = date_obj.strftime('%Y%m%d')
+            base_url = f"https://nomads.ncep.noaa.gov/pub/data/nccf/com/rtofs/prod/rtofs.{date_str}"
 
-            try:
-                head = session.head(url, timeout=10)
-                if head.status_code != 200:
-                    print("Not found.")
+            for filename in files_to_try:
+                url = f"{base_url}/{filename}"
+                print(f"• Trying {filename} for {date_str}...", end=" ", flush=True)
+
+                try:
+                    head = session.head(url, timeout=10)
+                    if head.status_code != 200:
+                        print("Not found.")
+                        continue
+
+                    print("Downloading...", end=" ", flush=True)
+                    r = session.get(url, stream=True, timeout=30)
+                    if r.status_code == 200:
+                        with open(temp_file, 'wb') as f:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk: f.write(chunk)
+                        success = True
+                        print("Done.")
+                        break
+                    else:
+                        print("Failed.")
+                        continue
+
+                except Exception as e:
+                    print(f"Error ({e}).")
+                    if os.path.exists(temp_file):
+                        try: os.remove(temp_file)
+                        except: pass
                     continue
 
-                print("Downloading...", end=" ", flush=True)
-                r = session.get(url, stream=True, timeout=30)
-                if r.status_code == 200:
-                    with open(temp_file, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if chunk: f.write(chunk)
-                else:
-                    print("Failed.")
-                    continue
+        if not success:
+            print("• All direct downloads failed.")
+            return None, None, None, None, None, None
 
-                print("Extracting...", end=" ", flush=True)
-                
-                ds = nc.Dataset(temp_file, 'r')
+    print("Extracting...", end=" ", flush=True)
+    try:
+        ds = nc.Dataset(temp_file, 'r')
 
-                lat_var = next((v for v in ['lat', 'Latitude', 'latitude'] if v in ds.variables), None)
-                lon_var = next((v for v in ['lon', 'Longitude', 'longitude'] if v in ds.variables), None)
+        lat_var = next((v for v in ['lat', 'Latitude', 'latitude'] if v in ds.variables), None)
+        lon_var = next((v for v in ['lon', 'Longitude', 'longitude'] if v in ds.variables), None)
 
-                lats_raw = ds.variables[lat_var][:]
-                lons_raw = ds.variables[lon_var][:]
-                lons_raw = np.where(lons_raw > 180, lons_raw - 360, lons_raw)
+        lats_raw = ds.variables[lat_var][:]
+        lons_raw = ds.variables[lon_var][:]
+        lons_raw = np.where(lons_raw > 180, lons_raw - 360, lons_raw)
 
-                lat_min, lat_max = extent[2] - 2, extent[3] + 2
-                lon_min, lon_max = extent[0] - 2, extent[1] + 2
+        lat_min, lat_max = extent[2] - 2, extent[3] + 2
+        lon_min, lon_max = extent[0] - 2, extent[1] + 2
 
-                if lats_raw.ndim == 2:
-                    mask = (lats_raw >= lat_min) & (lats_raw <= lat_max) & \
-                           (lons_raw >= lon_min) & (lons_raw <= lon_max)
-                    y_idxs, x_idxs = np.where(mask)
-                else:
-                    y_mask = (lats_raw >= lat_min) & (lats_raw <= lat_max)
-                    x_mask = (lons_raw >= lon_min) & (lons_raw <= lon_max)
-                    y_idxs = np.where(y_mask)[0]
-                    x_idxs = np.where(x_mask)[0]
+        if lats_raw.ndim == 2:
+            mask = (lats_raw >= lat_min) & (lats_raw <= lat_max) & \
+                   (lons_raw >= lon_min) & (lons_raw <= lon_max)
+            y_idxs, x_idxs = np.where(mask)
+        else:
+            y_mask = (lats_raw >= lat_min) & (lats_raw <= lat_max)
+            x_mask = (lons_raw >= lon_min) & (lons_raw <= lon_max)
+            y_idxs = np.where(y_mask)[0]
+            x_idxs = np.where(x_mask)[0]
 
-                if len(y_idxs) == 0 or len(x_idxs) == 0:
-                    print("Extent not in grid.")
-                    ds.close()
-                    continue
+        if len(y_idxs) == 0 or len(x_idxs) == 0:
+            print("Extent not in grid.")
+            ds.close()
+            return None, None, None, None, None, None
 
-                y_min_idx, y_max_idx = y_idxs.min(), y_idxs.max()
-                x_min_idx, x_max_idx = x_idxs.min(), x_idxs.max()
+        y_min_idx, y_max_idx = y_idxs.min(), y_idxs.max()
+        x_min_idx, x_max_idx = x_idxs.min(), x_idxs.max()
 
-                if lats_raw.ndim == 2:
-                    lats = lats_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
-                    lons = lons_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
-                else:
-                    lats = lats_raw[y_min_idx:y_max_idx+1]
-                    lons = lons_raw[x_min_idx:x_max_idx+1]
+        if lats_raw.ndim == 2:
+            lats = lats_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
+            lons = lons_raw[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
+        else:
+            lats = lats_raw[y_min_idx:y_max_idx+1]
+            lons = lons_raw[x_min_idx:x_max_idx+1]
 
-                sst_candidates = ['sst', 'SST', 'temperature', 'temp', 'sea_surface_temperature', 'Temperature']
-                u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u', 'surf_u', 'eastward_vel']
-                v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v', 'surf_v', 'northward_vel']
-                sal_candidates = ['sss', 'SSS', 'salinity', 'salt', 'Salinity', 'sea_surface_salinity']
+        sst_candidates = ['sst', 'SST', 'temperature', 'temp', 'sea_surface_temperature', 'Temperature']
+        u_candidates   = ['u_velocity', 'u', 'water_u', 'U', 'u_comp', 'velocity_u', 'surf_u', 'eastward_vel']
+        v_candidates   = ['v_velocity', 'v', 'water_v', 'V', 'v_comp', 'velocity_v', 'surf_v', 'northward_vel']
+        sal_candidates = ['sss', 'SSS', 'salinity', 'salt', 'Salinity', 'sea_surface_salinity']
 
-                sst_var = next((v for v in sst_candidates if v in ds.variables), None)
-                u_var   = next((v for v in u_candidates   if v in ds.variables), None)
-                v_var   = next((v for v in v_candidates   if v in ds.variables), None)
-                sal_var = next((v for v in sal_candidates if v in ds.variables), None)
+        sst_var = next((v for v in sst_candidates if v in ds.variables), None)
+        u_var   = next((v for v in u_candidates   if v in ds.variables), None)
+        v_var   = next((v for v in v_candidates   if v in ds.variables), None)
+        sal_var = next((v for v in sal_candidates if v in ds.variables), None)
 
-                def safe_slice(vname):
-                    if not vname: return None
-                    var_obj = ds.variables[vname]
-                    ndim = len(var_obj.shape)
-                    if ndim == 2: return var_obj[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
-                    if ndim == 3: return var_obj[0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
-                    if ndim == 4: return var_obj[0, 0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
-                    return None
+        def safe_slice(vname):
+            if not vname: return None
+            var_obj = ds.variables[vname]
+            ndim = len(var_obj.shape)
+            if ndim == 2: return var_obj[y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
+            if ndim == 3: return var_obj[0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
+            if ndim == 4: return var_obj[0, 0, y_min_idx:y_max_idx+1, x_min_idx:x_max_idx+1]
+            return None
 
-                w_temp = safe_slice(sst_var)
-                if w_temp is None: w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
-                else: w_temp = np.asarray(w_temp, dtype=np.float32)
+        w_temp = safe_slice(sst_var)
+        if w_temp is None: w_temp = np.full(lats.shape, np.nan, dtype=np.float32)
+        else: w_temp = np.asarray(w_temp, dtype=np.float32)
 
-                w_u = safe_slice(u_var)
-                if w_u is None: w_u = np.full_like(w_temp, np.nan)
-                else: w_u = np.asarray(w_u, dtype=np.float32)
+        w_u = safe_slice(u_var)
+        if w_u is None: w_u = np.full_like(w_temp, np.nan)
+        else: w_u = np.asarray(w_u, dtype=np.float32)
 
-                w_v = safe_slice(v_var)
-                if w_v is None: w_v = np.full_like(w_temp, np.nan)
-                else: w_v = np.asarray(w_v, dtype=np.float32)
+        w_v = safe_slice(v_var)
+        if w_v is None: w_v = np.full_like(w_temp, np.nan)
+        else: w_v = np.asarray(w_v, dtype=np.float32)
 
-                salinity = safe_slice(sal_var)
-                if salinity is None: salinity = np.full_like(w_temp, np.nan)
-                else: salinity = np.asarray(salinity, dtype=np.float32)
+        salinity = safe_slice(sal_var)
+        if salinity is None: salinity = np.full_like(w_temp, np.nan)
+        else: salinity = np.asarray(salinity, dtype=np.float32)
 
-                valid_temp = w_temp[np.isfinite(w_temp) & (w_temp > -50) & (w_temp < 100)]
-                if len(valid_temp) > 10 and np.nanmax(valid_temp) < 100:
-                    w_temp = np.where(np.isfinite(w_temp), w_temp + 273.15, w_temp)
+        valid_temp = w_temp[np.isfinite(w_temp) & (w_temp > -50) & (w_temp < 100)]
+        if len(valid_temp) > 10 and np.nanmax(valid_temp) < 100:
+            w_temp = np.where(np.isfinite(w_temp), w_temp + 273.15, w_temp)
 
-                ocean_mask = (np.isfinite(w_temp) & (w_temp > 270) & (w_temp < 310) & np.isfinite(w_u) & np.isfinite(w_v)) 
+        ocean_mask = (np.isfinite(w_temp) & (w_temp > 270) & (w_temp < 310) & np.isfinite(w_u) & np.isfinite(w_v)) 
 
-                w_temp = np.where(ocean_mask, w_temp, np.nan)
-                w_u    = np.where(ocean_mask, w_u,    np.nan)
-                w_v    = np.where(ocean_mask, w_v,    np.nan)
-                salinity = np.where(ocean_mask, salinity, np.nan)
+        w_temp = np.where(ocean_mask, w_temp, np.nan)
+        w_u    = np.where(ocean_mask, w_u,    np.nan)
+        w_v    = np.where(ocean_mask, w_v,    np.nan)
+        salinity = np.where(ocean_mask, salinity, np.nan)
 
-                print("Success! ✅ (ocean masked)")
-                ds.close()
-                if os.path.exists(temp_file): os.remove(temp_file)
-                    
-                return lats, lons, w_temp, w_u, w_v, salinity
+        print("Success! ✅ (ocean masked)")
+        ds.close()
+            
+        return lats, lons, w_temp, w_u, w_v, salinity
 
-            except Exception as e:
-                print(f"Error ({e}).")
-                if 'ds' in locals():
-                    try: ds.close()
-                    except: pass
-                if os.path.exists(temp_file):
-                    try: os.remove(temp_file)
-                    except: pass
-                continue
-
-    print("• All direct downloads failed.")
-    return None, None, None, None, None, None
+    except Exception as e:
+        print(f"Error ({e}).")
+        if 'ds' in locals():
+            try: ds.close()
+            except: pass
+        return None, None, None, None, None, None
 
 # ====================================================================
 # 5. OVERLAYS & COLORBARS
 # ====================================================================
 
 def draw_interstates_from_shapefile(ax, shapefile=INTERSTATES_SHP):
-    if not os.path.exists(shapefile): return
+    if not os.path.exists(shapefile): 
+        logging.error(f"Shapefile not found: {shapefile}")
+        return
     try:
         reader = shpreader.Reader(shapefile)
-        interstate_geoms = []
-        for record, geometry in zip(reader.records(), reader.geometries()):
-            attrs = record.attributes if hasattr(record, 'attributes') else record.__dict__
-            is_interstate = False
-            for key in ('RTTYP', 'RTE_TYPE', 'MTFCC'):
-                if key in attrs and str(attrs.get(key)).upper() == 'I': is_interstate = True
-            if not is_interstate and 'FULLNAME' in attrs and 'INTERSTATE' in str(attrs.get('FULLNAME')).upper():
-                is_interstate = True
-            if is_interstate: interstate_geoms.append(geometry)
-        if interstate_geoms:
-            ax.add_geometries(interstate_geoms, ccrs.PlateCarree(), edgecolor='#D14900', 
-                              facecolor='none', linewidth=1.2, zorder=3.5, alpha=0.9)
-    except Exception as e: pass
+        road_geoms = list(reader.geometries())
+        
+        if road_geoms:
+            ax.add_geometries(road_geoms, ccrs.PlateCarree(), edgecolor='white', 
+                              facecolor='none', linewidth=1.8, zorder=10, alpha=0.85)
+            ax.add_geometries(road_geoms, ccrs.PlateCarree(), edgecolor='black', 
+                              facecolor='none', linewidth=0.7, zorder=11, alpha=0.95)
+    except Exception as e: 
+        logging.error(f"Failed to draw interstates: {e}")
 
 def draw_major_cities(ax):
     cities = {
@@ -734,18 +826,79 @@ def draw_major_cities(ax):
                 path_effects=TEXT_OUTLINE, transform=ccrs.PlateCarree(), zorder=6)
 
 def draw_isobars(ax, grid_x, grid_y, grid_p, levels, fmt='%d mb'):
-    cs = ax.contour(grid_x, grid_y, grid_p, levels=levels, 
+    smoothed_p = gaussian_filter(grid_p, sigma=3.0)
+    
+    cs = ax.contour(grid_x, grid_y, smoothed_p, levels=levels, 
                     colors='white', linewidths=1.8, zorder=2.0, transform=ccrs.PlateCarree())
     cs.set_path_effects([pe.Stroke(linewidth=3.5, foreground='black'), pe.Normal()])
+    
     clabels = ax.clabel(cs, fmt=fmt, inline=True, inline_spacing=12, fontsize=10, colors='white')
     for label in clabels:
         label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
         label.set_fontweight('bold')
     return cs
 
+def draw_isotherms(ax, grid_x, grid_y, temp_c, levels_interval=2):
+    levels_cold = np.arange(-90, 1, levels_interval)
+    levels_warm = np.arange(levels_interval, 60, levels_interval)
+    
+    cs_cold = ax.contour(grid_x, grid_y, temp_c, levels=levels_cold,
+                         colors='#00BFFF', linestyles='--', linewidths=1.5,
+                         zorder=2.2, transform=ccrs.PlateCarree())
+    cs_cold.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    
+    clabels_cold = ax.clabel(cs_cold, fmt='%d°C', inline=True, inline_spacing=8, fontsize=10, colors='#00BFFF')
+    for label in clabels_cold:
+        label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
+        label.set_fontweight('bold')
+
+    cs_warm = ax.contour(grid_x, grid_y, temp_c, levels=levels_warm,
+                         colors='#FF4500', linestyles='--', linewidths=1.5,
+                         zorder=2.2, transform=ccrs.PlateCarree())
+    cs_warm.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    
+    clabels_warm = ax.clabel(cs_warm, fmt='%d°C', inline=True, inline_spacing=8, fontsize=10, colors='#FF4500')
+    for label in clabels_warm:
+        label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
+        label.set_fontweight('bold')
+
+def draw_isodrosotherms(ax, grid_x, grid_y, dp_f, interval=5):
+    """Draws tiered, dashed dew point contours (isodrosotherms)."""
+    smoothed_dp = gaussian_filter(dp_f, sigma=2.0)
+    
+    # Split levels into the requested tiers
+    levels_blue = np.arange(-40, 65, interval)
+    levels_green = np.arange(65, 75, interval)
+    levels_orange = np.arange(75, 91, interval)
+    
+    def plot_tier(levels, color):
+        if len(levels) == 0: return
+        cs = ax.contour(grid_x, grid_y, smoothed_dp, levels=levels, 
+                        colors=color, linestyles='--', linewidths=1.5, 
+                        zorder=2.3, transform=ccrs.PlateCarree())
+        cs.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+        
+        clabels = ax.clabel(cs, fmt='%d°F', inline=True, inline_spacing=8, fontsize=10, colors=color)
+        for label in clabels:
+            label.set_path_effects([pe.withStroke(linewidth=3, foreground='black'), pe.Normal()])
+            label.set_fontweight('bold')
+
+    # Execute plotting for each tier with its corresponding color
+    plot_tier(levels_blue, '#87CEFA')   # Light Blue
+    plot_tier(levels_green, '#32CD32')  # Lime Green
+    plot_tier(levels_orange, '#FFA500') # Orange
+
 def add_clean_colorbar(fig, ax, cf, label):
     if cf is not None:
-        cax = fig.add_axes([0.06, 0.08, 0.88, 0.025])
+        # Dynamically grab the map's exact position on the figure
+        pos = ax.get_position()
+        
+        # Shave off 0.4% from the edges so the triangular extensions don't stretch past the map
+        cb_x0 = pos.x0 + 0.004
+        cb_width = pos.width - 0.008
+        
+        # Bumped the Y-position up from 0.08 to 0.095 to clear the legend box
+        cax = fig.add_axes([cb_x0, 0.095, cb_width, 0.025])
         cb = fig.colorbar(cf, cax=cax, orientation='horizontal', extend='both', extendfrac=0.04)
         
         cb.set_label(label, fontsize=13, fontweight='bold', color='white', labelpad=10)
@@ -768,12 +921,12 @@ def add_clean_colorbar(fig, ax, cf, label):
         for tick_label in cb.ax.get_xticklabels():
             tick_label.set_path_effects(TEXT_OUTLINE)
 
-
 # ====================================================================
 # 6. CORE GENERATION PLOTS 
 # ====================================================================
 
 def generate_mslp_temp_map():
+    import matplotlib.lines as mlines
     logging.info("Starting Clean 2mb Surface Analysis Generator...")
     run_date = datetime.now(timezone.utc)
     
@@ -782,7 +935,7 @@ def generate_mslp_temp_map():
     rtma_data = fetch_rtma_sfc(EXTENT)
     ncom_lat, ncom_lon, ncom_temp_k, ncom_u, ncom_v, ncom_sal = fetch_ocean_currents(EXTENT)
     
-    grid_y, grid_x, g_temp, g_u, g_v, g_p = blend_surface_models(rap_data, hrrr_data, rtma_data, EXTENT)
+    grid_y, grid_x, g_temp, g_dp, g_u, g_v, g_p = blend_surface_models(rap_data, hrrr_data, rtma_data, EXTENT)
 
     fig = plt.figure(figsize=(18, 11), facecolor=FIG_BG_COLOR)
     ax = fig.add_axes([0.08, 0.16, 0.86, 0.75], projection=ccrs.PlateCarree())
@@ -810,38 +963,24 @@ def generate_mslp_temp_map():
         print("• Plotting Marine/Ocean Layer...", end=" ", flush=True)
         try:
             nc_x, nc_y = ncom_lon, ncom_lat
-            marine_vort, _, _ = calc_marine_physics(ncom_temp_k, ncom_u, ncom_v, 70, 60, 10)
-
-            ax.contour(nc_x, nc_y, marine_vort, levels=[-0.0001, -0.00005, 0.00005, 0.0001],
-                       colors=['blue', 'cyan', 'orange', 'red'], linewidths=1.2,
-                       alpha=0.6, transform=ccrs.PlateCarree(), zorder=1.56)
-
-            # Convert ocean current temp data matrix from Kelvin to Celsius
             ncom_temp_c = ncom_temp_k - 273.15
-
             stride = 6
             strm = ax.streamplot(nc_x[::stride, ::stride], nc_y[::stride, ::stride], 
                                  ncom_u[::stride, ::stride], ncom_v[::stride, ::stride], 
                                  color=ncom_temp_c[::stride, ::stride], cmap='jet',
                                  density=1.2, linewidth=1.5, arrowsize=1.5,
                                  transform=ccrs.PlateCarree(), zorder=2.0)
-            
             strm.lines.set_path_effects([pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
             
-            # Dedicated colorbar for ocean temperature
-            # Shifted slightly right to 0.02 to allow space for the left-side text labels
-            cax_marine = fig.add_axes([0.02, 0.16, 0.010, 0.75]) 
-            cbar = fig.colorbar(strm.lines, cax=cax_marine, label='Ocean Temp (°C)', extend='both')
-            
-            # === FLIP TEXT AND TICKS TO THE LEFT SIDE ===
+            cax_marine = fig.add_axes([0.03, 0.164, 0.008, 0.742]) 
+            cbar = fig.colorbar(strm.lines, cax=cax_marine, extend='both')
             cbar.ax.yaxis.set_label_position('left')
             cbar.ax.yaxis.set_ticks_position('left')
             
-            # Match the styling to your main colorbar
-            cbar.set_label('Ocean Temp (°C)', fontsize=11, fontweight='bold', color='white')
+            cbar.set_label('Ocean Temp (°C)', fontsize=9, fontweight='bold', color='white', labelpad=2)
             cbar.ax.yaxis.label.set_path_effects(TEXT_OUTLINE)
-            cbar.ax.tick_params(axis='y', colors='white', pad=6) # Small pad to prevent text-to-bar touching
             
+            cbar.ax.tick_params(axis='y', colors='white', pad=2, labelsize=8) 
             for tick_label in cbar.ax.get_yticklabels():
                 tick_label.set_path_effects(TEXT_OUTLINE)
                 tick_label.set_fontweight('bold')
@@ -852,6 +991,10 @@ def generate_mslp_temp_map():
     if g_p is not None:
         draw_isobars(ax, grid_x, grid_y, g_p, np.arange(950, 1050, 2), fmt='%d mb')
         
+    if g_dp is not None:
+        draw_isodrosotherms(ax, grid_x, grid_y, g_dp, interval=5)
+        
+    if g_u is not None and g_v is not None:
         skip = 13
         u_kts, v_kts = g_u[::skip, ::skip], g_v[::skip, ::skip]
         ax.barbs(grid_x[::skip, ::skip], grid_y[::skip, ::skip], u_kts, v_kts, 
@@ -860,25 +1003,45 @@ def generate_mslp_temp_map():
     draw_interstates_from_shapefile(ax)
     draw_major_cities(ax)
 
-    ax.set_title("CONUS Surface Analysis & High-Terrain Adjusted MSLP Gradient", fontsize=20, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, loc='left', pad=15)
-    ax.set_title(run_date.strftime('%d %B %Y %H:%MZ'), fontsize=16, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, loc='right', pad=15)
+    # --- CUSTOM LEGEND (Compacted and Nudged) ---
+    isobar_line = mlines.Line2D([], [], color='white', linewidth=1.8, label='MSLP (mb)', 
+                                path_effects=[pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    dp_blue = mlines.Line2D([], [], color='#87CEFA', linestyle='--', linewidth=1.5, label='Td < 65°F',
+                            path_effects=[pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    dp_green = mlines.Line2D([], [], color='#32CD32', linestyle='--', linewidth=1.5, label='Td 65-74°F',
+                             path_effects=[pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    dp_orange = mlines.Line2D([], [], color='#FFA500', linestyle='--', linewidth=1.5, label='Td ≥ 75°F',
+                              path_effects=[pe.Stroke(linewidth=3.0, foreground='black'), pe.Normal()])
+    
+    # Tightened box dimensions and shifted anchor to float cleanly
+    leg = fig.legend(handles=[isobar_line, dp_blue, dp_green, dp_orange], 
+                     loc='lower left', bbox_to_anchor=(0.01, 0.015),
+                     facecolor=LAND_COLOR, edgecolor='black', labelcolor='white',
+                     fontsize=10, framealpha=1.0, borderpad=0.6,
+                     handlelength=1.6, handletextpad=0.6)
+    leg.get_frame().set_linewidth(1.5)
+
+    ax.text(0.0, 1.02, "CONUS Surface Analysis & High-Terrain Adjusted MSLP Gradient", 
+            fontsize=20, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, 
+            transform=ax.transAxes, ha='left', va='bottom')
+    ax.text(1.0, 1.02, run_date.strftime('%d %B %Y %H:%MZ'), 
+            fontsize=16, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, 
+            transform=ax.transAxes, ha='right', va='bottom')
 
     add_clean_colorbar(fig, ax, cf_temp, 'Surface Temperature (°F)')
     
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, f"mslp_temp_{run_date.strftime('%Y%m%d_%H%M')}.png")
-    plt.savefig(out_path, dpi=150, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.2)
+    plt.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     logging.info(f"✅ Adjusted High-Terrain Map Saved: {out_path}")
     
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.2)
+    plt.savefig(buf, format='png', facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return buf, run_date
-
-def generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level, variable, cmap, title, cb_label, levels=None):
+def generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level, variable, cmap, title, cb_label, levels=None, wv_background=False, plot_vort_max=False, sat_ds=None, sat_var=None):
     try:
-        # Pre-compute Physics from Blended Array Grids
         heights_dam = hgt / 10.0
         
         if variable == 'wind_speed': data = compute_wind_speed(u, v)
@@ -908,13 +1071,83 @@ def generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level,
         draw_interstates_from_shapefile(ax)
         draw_major_cities(ax)
 
-        if levels is None:
-            cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), extend='both', alpha=0.85)
-        else:
-            cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), levels=levels, extend='both', alpha=0.85)
+        if wv_background and sat_ds is not None and sat_var is not None:
+            logging.info("Plotting true GOES-16 satellite overlay...")
+            sat_proj = sat_var.metpy.cartopy_crs
+            x = sat_ds['x'].values
+            y = sat_ds['y'].values
+            
+            grid_mapping = sat_var.attrs.get('grid_mapping')
+            if grid_mapping and grid_mapping in sat_ds:
+                proj_var = sat_ds[grid_mapping]
+                if getattr(proj_var, 'grid_mapping_name', '') == 'geostationary' and sat_ds['x'].attrs.get('units') == 'rad':
+                    height = getattr(proj_var, 'perspective_point_height', 35786023.0)
+                    x = x * height
+                    y = y * height
 
-        if level == 30000: h_levels = np.arange(800, 1040, 4) 
-        elif level == 50000: h_levels = np.arange(480, 620, 4)
+            sat_data = sat_var.metpy.magnitude
+            if getattr(sat_var.metpy, 'units', None) == 'K' or np.nanmax(sat_data) > 150:
+                sat_data = sat_data - 273.15
+
+            wv_levels = np.array([0, -15.5, -30, -47, -75, -100, -109])
+            C_RED = (1.0, 0.0, 0.0); C_YELLOW = (1.0, 1.0, 0.0); C_BLUE = (0.0, 0.0, 1.0)
+            C_WHITE = (1.0, 1.0, 1.0); C_GREEN = (0.0, 0.5, 0.0); C_TEAL = (0.0, 1.0, 1.0); C_LB = (0.5, 0.5, 1.0)
+
+            span = wv_levels.max() - wv_levels.min()
+            nodes = np.flip((wv_levels - wv_levels.min()) / span)
+            node_colors = [C_RED, C_YELLOW, C_BLUE, C_WHITE, C_GREEN, C_TEAL, C_LB][::-1]
+            nodes[0] = 0.0; nodes[-1] = 1.0
+            wv_cmap = LinearSegmentedColormap.from_list('custom_wv_cmap', list(zip(nodes, node_colors)))
+            norm = mcolors.Normalize(vmin=-109, vmax=0)
+            
+            main_cf = ax.pcolormesh(x, y, sat_data, cmap=wv_cmap, norm=norm, 
+                                    transform=sat_proj, shading='auto', zorder=1.5, alpha=0.90)
+
+            cax = fig.add_axes([0.06, 0.08, 0.88, 0.025])
+            cbar = fig.colorbar(main_cf, cax=cax, orientation='horizontal', extend='both')
+            cbar.set_label('Temp (°C)', fontsize=13, fontweight='bold', color='white', labelpad=10)
+            cbar.ax.xaxis.label.set_path_effects(TEXT_OUTLINE)
+            cb_ticks = np.sort(wv_levels)
+            cbar.set_ticks(cb_ticks)
+            cbar.ax.set_xticklabels([f"{t:g}" for t in cb_ticks], fontsize=11, fontweight='bold', color='white')
+            for tick in cbar.ax.get_xticklabels(): tick.set_path_effects(TEXT_OUTLINE)
+            
+        elif wv_background and rh is not None:
+            logging.warning("Satellite overlay failed. Falling back to RH simulation...")
+            rh_points = [0, 15, 30, 50, 70, 85, 100]
+            temp_points = [0, -15.5, -30, -47, -75, -100, -109]
+            sim_wv_temp = np.interp(np.clip(rh, 0, 100), rh_points, temp_points)
+
+            wv_levels = np.array([0, -15.5, -30, -47, -75, -100, -109])
+            C_RED = (1.0, 0.0, 0.0); C_YELLOW = (1.0, 1.0, 0.0); C_BLUE = (0.0, 0.0, 1.0)
+            C_WHITE = (1.0, 1.0, 1.0); C_GREEN = (0.0, 0.5, 0.0); C_TEAL = (0.0, 1.0, 1.0); C_LB = (0.5, 0.5, 1.0)
+            span = wv_levels.max() - wv_levels.min()
+            nodes = np.flip((wv_levels - wv_levels.min()) / span)
+            node_colors = [C_RED, C_YELLOW, C_BLUE, C_WHITE, C_GREEN, C_TEAL, C_LB][::-1]
+            nodes[0] = 0.0; nodes[-1] = 1.0
+            wv_cmap = LinearSegmentedColormap.from_list('custom_wv_cmap', list(zip(nodes, node_colors)))
+            norm = mcolors.Normalize(vmin=-109, vmax=0)
+            
+            main_cf = ax.pcolormesh(grid_x, grid_y, sim_wv_temp, cmap=wv_cmap, norm=norm, alpha=0.85, transform=ccrs.PlateCarree(), shading='auto', zorder=1.5)
+
+            cax = fig.add_axes([0.06, 0.08, 0.88, 0.025])
+            cbar = fig.colorbar(main_cf, cax=cax, orientation='horizontal', extend='both')
+            cbar.set_label('Temp (°C)', fontsize=13, fontweight='bold', color='white', labelpad=10)
+            cbar.ax.xaxis.label.set_path_effects(TEXT_OUTLINE)
+            cb_ticks = np.sort(wv_levels)
+            cbar.set_ticks(cb_ticks)
+            cbar.ax.set_xticklabels([f"{t:g}" for t in cb_ticks], fontsize=11, fontweight='bold', color='white')
+            for tick in cbar.ax.get_xticklabels(): tick.set_path_effects(TEXT_OUTLINE)
+        else:
+            if levels is None:
+                cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), extend='both', alpha=0.85)
+            else:
+                cf = ax.contourf(grid_x, grid_y, data, cmap=cmap, transform=ccrs.PlateCarree(), levels=levels, extend='both', alpha=0.85)
+            main_cf = cf
+            add_clean_colorbar(fig, ax, main_cf, cb_label)
+
+        if level == 50000: h_levels = np.arange(480, 620, 6)
+        elif level == 30000: h_levels = np.arange(800, 1040, 4) 
         elif level == 70000: h_levels = np.arange(210, 350, 4)
         elif level == 85000: h_levels = np.arange(90, 230, 4) 
         else: h_levels = None
@@ -922,39 +1155,71 @@ def generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level,
         if h_levels is not None:
             draw_isobars(ax, grid_x, grid_y, heights_dam, h_levels, fmt='%i dam')
 
-        skip = 24
-        u_wind_knots, v_wind_knots = u * 1.94384, v * 1.94384
+        if level in [85000, 70000, 50000]:
+            temp_c = temp - 273.15
+            draw_isotherms(ax, grid_x, grid_y, temp_c, levels_interval=5)
+
+        if plot_vort_max and variable == 'vorticity':
+            from scipy.ndimage import maximum_filter
+            vort_max = maximum_filter(data, size=15)
+            local_max = (data == vort_max) & (data > 10)
+            y_idx, x_idx = np.where(local_max)
+            
+            for i in range(len(y_idx)):
+                lon_val = grid_x[y_idx[i], x_idx[i]]
+                lat_val = grid_y[y_idx[i], x_idx[i]]
+                
+                if (EXTENT[0] <= lon_val <= EXTENT[1]) and (EXTENT[2] <= lat_val <= EXTENT[3]):
+                    ax.plot(lon_val, lat_val, 'X',
+                            color='yellow', markersize=14, markeredgecolor='black', 
+                            markeredgewidth=2, zorder=6, transform=ccrs.PlateCarree(), clip_on=True)
+                    ax.text(lon_val + 0.4, lat_val + 0.4,
+                            f"{data[y_idx[i], x_idx[i]]:.0f}", color='yellow', fontsize=10,
+                            fontweight='bold', path_effects=TEXT_OUTLINE, zorder=7, 
+                            transform=ccrs.PlateCarree(), clip_on=True)
+
+        u_wind_knots = u * 1.94384
+        v_wind_knots = v * 1.94384
+
+        skip = 24 if not plot_vort_max else 16
         ax.barbs(grid_x[::skip, ::skip], grid_y[::skip, ::skip], u_wind_knots[::skip, ::skip], v_wind_knots[::skip, ::skip], 
                  transform=ccrs.PlateCarree(), length=6, color='black', zorder=4)
 
-        ax.set_title(f"{title}", fontsize=20, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, loc='left', pad=15)
-        ax.set_title(run_date.strftime('%d %B %Y %H:%MZ'), fontsize=16, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, loc='right', pad=15)
-
-        add_clean_colorbar(fig, ax, cf, cb_label)
+        ax.text(0.0, 1.02, f"{title}", 
+                fontsize=20, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, 
+                transform=ax.transAxes, ha='left', va='bottom')
+        ax.text(1.0, 1.02, run_date.strftime('%d %B %Y %H:%MZ'), 
+                fontsize=16, color='white', fontweight='bold', path_effects=TEXT_OUTLINE, 
+                transform=ax.transAxes, ha='right', va='bottom')
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.2)
+        plt.savefig(buf, format='png', facecolor=fig.get_facecolor())
         plt.close(fig)
         buf.seek(0)
         return buf
     except Exception as e:
         logging.error(f"Upper Air Generation Error: {e}", exc_info=True)
         return None
-
+    
 # ====================================================================
 # 7. UNIFIED PIPELINE RUNNERS
 # ====================================================================
 
-def run_upper_air_pipeline(level, variable, cmap, title, cb_label, levels=None):
-    """Centralized pipeline to Fetch, Blend, and Generate Upper Air Maps."""
+def run_upper_air_pipeline(level, variable, cmap, title, cb_label, levels=None, wv_background=False, plot_vort_max=False):
+    """RAP-only pipeline with actual GOES-16 overlay integration."""
     run_date = datetime.now(timezone.utc)
-    rap = fetch_upper_air_model('RAP', level)
-    gfs = fetch_upper_air_model('GFS', level)
     
-    grid_x, grid_y, hgt, u, v, temp, rh = blend_upper_air_models([rap, gfs], EXTENT)
+    grid_x, grid_y, hgt, u, v, temp, rh = blend_upper_air_models(level, EXTENT)
+    
+    sat_ds, sat_var = None, None
+    if wv_background:
+        sat_ds, sat_var = fetch_goes_ch9()
     
     if grid_x is not None:
-        buf = generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, level, variable, cmap, title, cb_label, levels)
+        buf = generate_upper_air_map(grid_x, grid_y, hgt, u, v, temp, rh, run_date, 
+                                     level, variable, cmap, title, cb_label, levels,
+                                     wv_background=wv_background, plot_vort_max=plot_vort_max,
+                                     sat_ds=sat_ds, sat_var=sat_var)
         if buf:
             os.makedirs(OUTPUT_DIR, exist_ok=True)
             filename = f"{variable}_{int(level/100)}mb_{run_date.strftime('%Y%m%d_%H%MZ')}.png"
@@ -963,34 +1228,40 @@ def run_upper_air_pipeline(level, variable, cmap, title, cb_label, levels=None):
             logging.info(f"✅ Generated {filename}")
 
 def run_wind300():
-    run_upper_air_pipeline(30000, 'wind_speed', 'cool', 'Blended RAP/GFS: 300-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 201, 10))
+    run_upper_air_pipeline(30000, 'wind_speed', 'cool', 'RAP Analysis: 300-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 201, 10))
 
 def run_wind500():
-    run_upper_air_pipeline(50000, 'wind_speed', 'YlOrBr', 'Blended RAP/GFS: 500-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 181, 10))
+    run_upper_air_pipeline(50000, 'wind_speed', 'YlOrBr', 'RAP Analysis: 500-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 181, 10))
 
 def run_vort500():
-    run_upper_air_pipeline(50000, 'vorticity', 'seismic', 'Blended RAP/GFS: 500-hPa Relative Vorticity and Heights', 'Vorticity ($10^{-5}$ s$^{-1}$)', np.linspace(-20, 20, 41))
+    run_upper_air_pipeline(50000, 'vorticity', 'seismic', 'RAP Analysis: 500-hPa Relative Vorticity and Heights', 'Vorticity ($10^{-5}$ s$^{-1}$)', np.linspace(-20, 20, 41), plot_vort_max=True)
 
+def run_500wv():
+    run_upper_air_pipeline(50000, 'vorticity', 'RdBu_r', 
+                           'RAP 500mb Analysis — Water Vapor / Heights / Vort Max', 
+                           'Vorticity (10⁻⁵ s⁻¹)', np.linspace(-25, 25, 51),
+                           wv_background=True, plot_vort_max=True)
+    
 def run_rh700():
-    run_upper_air_pipeline(70000, 'relative_humidity', 'BuGn', 'Blended RAP/GFS: 700-hPa Relative Humidity and Heights', 'Relative Humidity (%)', np.arange(10, 101, 5))
+    run_upper_air_pipeline(70000, 'relative_humidity', 'BuGn', 'RAP Analysis: 700-hPa Relative Humidity and Heights', 'Relative Humidity (%)', np.arange(10, 101, 5))
 
 def run_fronto700():
-    run_upper_air_pipeline(70000, 'frontogenesis', 'RdBu_r', 'Blended RAP/GFS: 700-hPa Frontogenesis and Heights', 'Frontogenesis (K/100km/3hr)', np.linspace(-10, 10, 41))
+    run_upper_air_pipeline(70000, 'frontogenesis', 'RdBu_r', 'RAP Analysis: 700-hPa Frontogenesis and Heights', 'Frontogenesis (K/100km/3hr)', np.linspace(-10, 10, 41))
 
 def run_wind850():
-    run_upper_air_pipeline(85000, 'wind_speed', 'YlOrBr', 'Blended RAP/GFS: 850-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 141, 10))
+    run_upper_air_pipeline(85000, 'wind_speed', 'YlOrBr', 'RAP Analysis: 850-hPa Wind Speeds and Heights', 'Wind Speed (knots)', np.arange(20, 141, 10))
 
 def run_dew850():
-    run_upper_air_pipeline(85000, 'dewpoint', 'BuGn', 'Blended RAP/GFS: 850-hPa Dewpoint and Heights', 'Dewpoint (°C)', np.arange(-40, 31, 2))
+    run_upper_air_pipeline(85000, 'dewpoint', 'BuGn', 'RAP Analysis: 850-hPa Dewpoint and Heights', 'Dewpoint (°C)', np.arange(-40, 31, 2))
 
 def run_mAdv850():
-    run_upper_air_pipeline(85000, 'moisture_advection', 'PRGn', 'Blended RAP/GFS: 850-hPa Moisture Advection and Heights', 'Moisture Advection (%/hour)', np.linspace(-20, 20, 41))
+    run_upper_air_pipeline(85000, 'moisture_advection', 'PRGn', 'RAP Analysis: 850-hPa Moisture Advection and Heights', 'Moisture Advection (%/hour)', np.linspace(-20, 20, 41))
 
 def run_tAdv850():
-    run_upper_air_pipeline(85000, 'temp_advection', 'coolwarm', 'Blended RAP/GFS: 850-hPa Temperature Advection and Heights', 'Temperature Advection (K/hour)', np.linspace(-20, 20, 41))
+    run_upper_air_pipeline(85000, 'temp_advection', 'coolwarm', 'RAP Analysis: 850-hPa Temperature Advection and Heights', 'Temperature Advection (K/hour)', np.linspace(-20, 20, 41))
 
 def run_divcon300():
-    run_upper_air_pipeline(30000, 'divergence', 'RdBu_r', 'Blended RAP/GFS: 300-hPa Divergence and Heights', 'Divergence ($10^{-5}$ s$^{-1}$)', np.linspace(-15, 15, 31))
+    run_upper_air_pipeline(30000, 'divergence', 'RdBu_r', 'RAP Analysis: 300-hPa Divergence and Heights', 'Divergence ($10^{-5}$ s$^{-1}$)', np.linspace(-15, 15, 31))
 
 def run_mslp():
     generate_mslp_temp_map()
@@ -1007,6 +1278,7 @@ def main():
     subparsers.add_parser('tempgrad', help='MSLP with surface temperature gradient')
     subparsers.add_parser('wind300', help='300 hPa Wind Speed')
     subparsers.add_parser('wind500', help='500 hPa Wind Speed')
+    subparsers.add_parser('500wv', help='500mb Water Vapor + Heights + Vort Max')
     subparsers.add_parser('vort500', help='500 hPa Relative Vorticity')
     subparsers.add_parser('rh700', help='700 hPa Relative Humidity')
     subparsers.add_parser('fronto700', help='700 hPa Frontogenesis')
@@ -1025,6 +1297,7 @@ def main():
         'wind300': run_wind300,
         'wind500': run_wind500,
         'vort500': run_vort500,
+        '500wv': run_500wv,
         'rh700': run_rh700,
         'fronto700': run_fronto700,
         'wind850': run_wind850,
