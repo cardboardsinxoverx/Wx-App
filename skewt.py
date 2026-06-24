@@ -14,6 +14,7 @@ import sharppy.sharptab.params as params
 import sharppy.sharptab.winds as winds
 import sharppy.sharptab.interp as interp
 from metpy.units import units
+import mplcursors
 
 # --- APPLYING FROSTBYTE THEME GLOBALS ---
 plt.rcParams['font.family'] = 'DejaVu Sans'
@@ -80,7 +81,12 @@ STATIONS = {
     'BNA': (36.12, -86.68),  'GSO': (36.08, -79.95),  'ILN': (39.43, -83.81),
     'LBF': (41.13, -100.68), 'ABR': (45.45, -98.42),  'BIS': (46.77, -100.75),
     'RAP': (44.05, -103.21), 'EET': (33.17, -86.77),  'CHS': (32.90, -80.04),
-    'TLH': (30.39, -84.35),  'JAX': (30.49, -81.69)
+    'TLH': (30.39, -84.35),  'JAX': (30.49, -81.69),
+
+    # --- Added Texas Sounding Additions ---
+    'AUS': (30.19, -97.67),  'SAT': (29.53, -98.47),  'BRO': (25.92, -97.43),
+    'CRP': (27.77, -97.50),  'SJT': (31.35, -100.50), 'MAF': (31.94, -102.20),
+    'LBB': (33.66, -101.82), 'ELP': (31.81, -106.38), 'GGG': (32.38, -94.71)
 }
 
 # Mapping to NWS station IDs with working BUFKIT links
@@ -98,7 +104,11 @@ NWS_STATIONS = {
     'LZK': 'KLZK', 'OAX': 'KOAX', 'MPX': 'KMPX', 'DDC': 'KDDC', 'AMA': 'KAMA',
     'FWD': 'KFWD', 'JAN': 'KJAN', 'BNA': 'KBNA', 'GSO': 'KGSO', 'ILN': 'KILN',
     'LBF': 'KLBF', 'ABR': 'KABR', 'BIS': 'KBIS', 'RAP': 'KRAP', 'EET': 'KBMX',
-    'CHS': 'KCHS', 'TLH': 'KTLH', 'JAX': 'KJAX'
+    'CHS': 'KCHS', 'TLH': 'KTLH', 'JAX': 'KJAX',
+
+    # --- Added Texas Sounding Additions ---
+    'AUS': 'KAUS', 'SAT': 'KSAT', 'BRO': 'KBRO', 'CRP': 'KCRP', 'SJT': 'KSJT',
+    'MAF': 'KMAF', 'LBB': 'KLBB', 'ELP': 'KELP', 'GGG': 'KGGG'
 }
 
 OUTPUT_DIR = os.path.join(os.getcwd(), 'output')
@@ -175,24 +185,69 @@ async def fetch_bufkit_data_async(station_code, model, forecast_hour, max_retrie
     if not nws_station:
         raise ValueError(f"No NWS station mapping found for {station_code}.")
 
-    model_dirs = {
-        'gfs': 'gfs/gfs3', 
-        'gfsm': 'gfsm/gfs3', 
-        'nam': 'nam/nam', 
-        'namm': 'namm/namm', 
-        'rap': 'rap/rap'
-    }
-    
-    model_dir = model_dirs.get(model.lower())
-    url = f"http://www.meteor.iastate.edu/~ckarsten/bufkit/data/{model_dir}_{nws_station.lower()}.buf"
+    bufkit_text = None
+    model_lower = model.lower()
 
+    # ROUTE 1: Iowa State IEM API (Extremely fast & reliable for core models)
+    if model_lower in ['gfs', 'gfsm', 'nam', 'namm', 'rap']:
+        api_models = {'gfs': 'GFS', 'gfsm': 'GFS', 'nam': 'NAM', 'namm': 'NAMNEST', 'rap': 'RAP'}
+        target_model = api_models[model_lower]
+        url = f"https://mesonet.agron.iastate.edu/api/1/nws/bufkit.txt?station={nws_station.upper()}&model={target_model}"
+
+        for attempt in range(max_retries):
+            try:
+                response = await asyncio.to_thread(requests.get, url, timeout=10)
+                if response.status_code == 200 and 'TIME =' in response.text:
+                    bufkit_text = response.text
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(retry_delay)
+
+    # ROUTE 2: Iowa State MTArchive + Penn State FTP (Dual-layer specifically for the HRRR)
+    elif model_lower == 'hrrr':
+        import urllib.request
+        utc_now = datetime.datetime.now(pytz.UTC)
+        
+        # The HRRR runs hourly. Search backwards up to 6 hours to find the latest uploaded cycle.
+        for hour_offset in range(6):
+            cycle_time = utc_now - datetime.timedelta(hours=hour_offset)
+            cycle_str = f"{cycle_time.hour:02d}"
+            date_path = cycle_time.strftime("%Y/%m/%d")
+            
+            # Primary: MTArchive HTTPS structure
+            url = f"https://mtarchive.geol.iastate.edu/{date_path}/bufkit/{cycle_str}/hrrr/hrrr_{nws_station.lower()}.buf"
+            try:
+                response = await asyncio.to_thread(requests.get, url, timeout=5)
+                if response.status_code == 200 and 'TIME =' in response.text:
+                    bufkit_text = response.text
+                    break
+            except Exception:
+                pass
+
+            # Secondary: Penn State FTP Fallback
+            ftp_url = f"ftp://ftp.meteo.psu.edu/pub/bufkit/HRRR/{cycle_str}/hrrr_{nws_station.lower()}.buf"
+            try:
+                def fetch_ftp():
+                    req = urllib.request.Request(ftp_url)
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        return resp.read().decode('utf-8', errors='replace')
+                text = await asyncio.to_thread(fetch_ftp)
+                if 'TIME =' in text:
+                    bufkit_text = text
+                    break
+            except Exception:
+                pass
+                
+            if bufkit_text:
+                break
+
+    if not bufkit_text:
+        raise ValueError(f"Failed to fetch BUFKIT file. Ensure {model.upper()} provides data for {station_code}.")
+
+    # Parse the successfully fetched text
     for attempt in range(max_retries):
         try:
-            response = await asyncio.to_thread(requests.get, url, timeout=10)
-            if response.status_code != 200:
-                raise ValueError(f"Failed to fetch BUFKIT file.")
-            
-            bufkit_text = response.text
             df, valid_time = await asyncio.to_thread(parse_bufkit_text, bufkit_text, forecast_hour)
             
             df.replace(-9999.00, np.nan, inplace=True)
@@ -453,6 +508,17 @@ def guess_precip_type(p, T, Td, wet_bulb, z, wb0_height):
         if len(p) < 5 or wet_bulb is None:
             return "❓ Unknown", "Low", "Insufficient vertical resolution"
 
+        # --- NEW: DRY COLUMN / NO PRECIP CHECK ---
+        # Look for a saturated cloud deck below 400 hPa. If the closest the 
+        # temperature and dewpoint ever get to each other is > 4°C apart, 
+        # the column is generally too dry to support measurable surface precipitation.
+        valid_p_idx = np.where(p.magnitude > 400)[0] 
+        if len(valid_p_idx) > 0:
+            min_dewpoint_depression = np.min((T[valid_p_idx] - Td[valid_p_idx]).magnitude)
+            if min_dewpoint_depression > 5.0:
+                return "None", "High", "Column too dry for precipitation (Min Dewpoint Depression > 5°C)"
+        # ----------------------------------------
+
         surface_wb = wet_bulb[0].to('degC').magnitude
         wb0_agl = np.nan
         
@@ -510,14 +576,22 @@ async def generate_skewt_plot(args):
             station_code = args[0].upper()
             sounding_time = args[1].upper()
             
-            if sounding_time not in ['00Z', '12Z']:
-                raise ValueError("Invalid time. Use '00Z' or '12Z'.")
+            # --- NEW: Allow any valid XXZ time using regex ---
+            if not re.match(r'^\d{2}Z$', sounding_time):
+                raise ValueError("Invalid time format. Use 'XXZ' (e.g., '00Z', '06Z', '12Z', '18Z').")
                 
-            hour = 12 if sounding_time == "12Z" else 0
+            # Extract the integer hour from the string (e.g., '06Z' -> 6)
+            hour = int(sounding_time.replace('Z', ''))
+            
+            if not (0 <= hour <= 23):
+                raise ValueError("Hour must be between 00Z and 23Z.")
+                
             now = datetime.datetime(utc_time.year, utc_time.month, utc_time.day, hour, 0, 0, tzinfo=pytz.UTC)
             
+            # If the requested hour is ahead of the current UTC time, assume it's from yesterday
             if now > utc_time: 
                 now -= datetime.timedelta(days=1)
+            # --------------------------------------------------
             
             df = await fetch_sounding_data(now, station_code, "observed")
             if df is None: 
@@ -668,7 +742,13 @@ async def generate_skewt_plot(args):
         # Calculate Most Unstable Parcel
         try:
             mu_p, mu_t, mu_td, _ = mpcalc.most_unstable_parcel(p, T, Td, depth=300 * units.hPa)
-            mu_prof = mpcalc.parcel_profile(p_truncated, mu_t, mu_td).to('degC')
+            
+            # Create a pressure array starting exactly at the MU parcel level
+            p_mu_ascent = p_truncated[p_truncated <= mu_p]
+            if len(p_mu_ascent) == 0 or p_mu_ascent[0] != mu_p:
+                p_mu_ascent = np.insert(p_mu_ascent.magnitude, 0, mu_p.magnitude) * units.hPa
+                
+            mu_prof = mpcalc.parcel_profile(p_mu_ascent, mu_t, mu_td).to('degC')
             mucape, mucin = mpcalc.most_unstable_cape_cin(p, T, Td, depth=300 * units.hPa)
             
             # --- TRUE MAXIMUM PARCEL LEVEL (MPL) VIA SHARPPY ---
@@ -702,6 +782,8 @@ async def generate_skewt_plot(args):
             mucape = np.nan * units('J/kg')
             mucin = np.nan * units('J/kg')
             mu_p = None
+            mu_prof = None
+            p_mu_ascent = None
             true_mpl_p = None
             mpl_height = np.nan * units.m
             
@@ -739,13 +821,13 @@ async def generate_skewt_plot(args):
         storm_u = units.Quantity(su_val, 'm/s')
         storm_v = units.Quantity(sv_val, 'm/s')
 
-        total_helicity1, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=1 * units.km, storm_u=storm_u, storm_v=storm_v)
-        total_helicity3, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=3 * units.km, storm_u=storm_u, storm_v=storm_v)
-        total_helicity6, _, _ = mpcalc.storm_relative_helicity(z, u, v, depth=6 * units.km, storm_u=storm_u, storm_v=storm_v)
-        
-        bshear1 = mpcalc.bulk_shear(p, u, v, depth=1 * units.km)
-        bshear3 = mpcalc.bulk_shear(p, u, v, depth=3 * units.km)
-        bshear6 = mpcalc.bulk_shear(p, u, v, depth=6 * units.km)
+        _, _, total_helicity1 = mpcalc.storm_relative_helicity(z, u, v, depth=1 * units.km, storm_u=storm_u, storm_v=storm_v)
+        _, _, total_helicity3 = mpcalc.storm_relative_helicity(z, u, v, depth=3 * units.km, storm_u=storm_u, storm_v=storm_v)
+        _, _, total_helicity6 = mpcalc.storm_relative_helicity(z, u, v, depth=6 * units.km, storm_u=storm_u, storm_v=storm_v)
+
+        bshear1 = mpcalc.bulk_shear(p, u, v, height=z, depth=1 * units.km)
+        bshear3 = mpcalc.bulk_shear(p, u, v, height=z, depth=3 * units.km)
+        bshear6 = mpcalc.bulk_shear(p, u, v, height=z, depth=6 * units.km)
         
         bshear1_mag = np.sqrt(bshear1[0]**2 + bshear1[1]**2) if bshear1 is not None else np.nan * units('m/s')
         bshear3_mag = np.sqrt(bshear3[0]**2 + bshear3[1]**2) if bshear3 is not None else np.nan * units('m/s')
@@ -855,13 +937,38 @@ async def generate_skewt_plot(args):
                     locals()[var_name] = var[0] 
                 else:
                     locals()[var_name] = np.nan * var.units
-
         try:
+            # Attempt to calculate EBWD for the true SPC formulation
+            ebwd_ms = np.nan
+            if spc_eil_pbot is not None and mupcl is not None and hasattr(mupcl, 'elpres') and float(mupcl.elpres) > 0:
+                el_msl = interp.hght(prof_spc, float(mupcl.elpres))
+                if float(el_msl) > 0:
+                    el_agl = interp.to_agl(prof_spc, float(el_msl))
+                    ebwd_top_msl = interp.to_msl(prof_spc, float(el_agl) * 0.5)
+                    ebwd_top = float(interp.pres(prof_spc, ebwd_top_msl))
+                    
+                    if ebwd_top > 0:
+                        ebwd_u, ebwd_v = winds.wind_shear(prof_spc, pbot=float(spc_eil_pbot), ptop=ebwd_top)
+                        if float(ebwd_u) != -9999.0:
+                            ebwd_ms = np.sqrt(float(ebwd_u)**2 + float(ebwd_v)**2) * 0.514444 # Knots to m/s
+        
+            # Route 1: True Effective SCP
+            if 'spc_esrh' in locals() and not np.isnan(spc_esrh) and not np.isnan(ebwd_ms):
+                esrh_m2s2 = spc_esrh * units('m^2/s^2')
+                ebwd_vector = ebwd_ms * units('m/s')
+                super_comp = mpcalc.supercell_composite(mucape, esrh_m2s2, ebwd_vector).to_base_units()
+                
+            # Route 2: Fixed-Layer Fallback SCP
+            else:
+                super_comp = mpcalc.supercell_composite(mucape, total_helicity3, bshear6_mag).to_base_units()
+        
             sig_tor = mpcalc.significant_tornado(sbcape, lcl_height, total_helicity1, bshear6_mag).to_base_units()
-            super_comp = mpcalc.supercell_composite(mucape, total_helicity3, bshear6_mag).to_base_units()
-        except Exception: 
+        
+        except Exception as e: 
+            logger.error(f"Error calculating composite parameters: {e}")
             sig_tor = np.nan * units.dimensionless
             super_comp = np.nan * units.dimensionless
+
             
         if isinstance(sig_tor.magnitude, np.ndarray): 
             sig_tor = sig_tor[0] if sig_tor.magnitude.size > 0 else np.nan * units.dimensionless
@@ -943,6 +1050,7 @@ async def generate_skewt_plot(args):
 
     try:
         fig = plt.figure(figsize=(30, 15))
+        fig.set_constrained_layout(True)
         fig.set_facecolor(FIG_BG_COLOR)
 
         text_outline = TEXT_OUTLINE
@@ -958,23 +1066,58 @@ async def generate_skewt_plot(args):
         for i in range(0, 8): 
             skew.shade_area(y=[1050, 100], x1=x1_vals[i], x2=x2_vals[i], color='cyan', alpha=0.1, zorder=1)
 
-        skew.plot(p, T, 'r', linewidth=2, label='Temperature', path_effects=text_outline)
-        skew.plot(p, Td, 'g', linewidth=2, label='Dewpoint', path_effects=text_outline)
-        skew.plot(p, wet_bulb.to('degC'), 'b', linestyle='--', linewidth=2, label='Wet Bulb', path_effects=text_outline)
+        # --- RE-ADD AND CAPTURE THE TRACES ---
+        t_line = skew.plot(p, T, 'r', linewidth=2, label='Temperature', path_effects=text_outline)[0]
+        td_line = skew.plot(p, Td, 'g', linewidth=2, label='Dewpoint', path_effects=text_outline)[0]
+        wb_line = skew.plot(p, wet_bulb.to('degC'), 'b', linestyle='--', linewidth=2, label='Wet Bulb', path_effects=text_outline)[0]
+
+        # =================================================================
+        # --- INTERACTIVE HOVER TRACING (mplcursors) ---
+        # =================================================================
+        try:
+            # 1. Trace the Skew-T Lines (Temp, Dewpoint, Wetbulb)
+            skew_cursor = mplcursors.cursor([t_line, td_line, wb_line], hover=True)
+            @skew_cursor.connect("add")
+            def on_skew_add(sel):
+                # Format: Temp °C \n Pressure hPa
+                sel.annotation.set_text(f"{sel.target[0]:.1f} °C\n{sel.target[1]:.0f} hPa")
+                sel.annotation.get_bbox_patch().set(facecolor='#2B2B2B', edgecolor='white', alpha=0.9)
+                sel.annotation.set_color('white')
+
+            # 2. Trace the Hodograph Line
+            hodo_cursor = mplcursors.cursor(colored_line, hover=True)
+            @hodo_cursor.connect("add")
+            def on_hodo_add(sel):
+                # Format: U m/s \n V m/s
+                sel.annotation.set_text(f"U: {sel.target[0]:.1f} m/s\nV: {sel.target[1]:.1f} m/s")
+                sel.annotation.get_bbox_patch().set(facecolor='#2B2B2B', edgecolor='white', alpha=0.9)
+                sel.annotation.set_color('white')
+
+            # Prevent garbage collection of the cursors
+            fig._cursors = [skew_cursor, hodo_cursor]
+            
+        except Exception as e:
+            logger.error(f"Interactive cursor failed to load: {e}")
+
+        logger.info(f"Skew-T diagram generated and returning figure for {station_code}")
+    
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         
-        if prof is not None:
+        if 'prof' in locals() and prof is not None:
             skew.plot(p_truncated, prof, 'white', linewidth=2.5, label='SB Parcel')
             
-        if ml_prof is not None: 
+        if 'ml_prof' in locals() and ml_prof is not None: 
             skew.plot(p_truncated, ml_prof, 'm', linewidth=2, label='ML Parcel', ls=(0, (5, 5)))
             
-        if mu_prof is not None: 
-            skew.plot(p_truncated, mu_prof, 'y', linewidth=2, label='MU Parcel', ls=(0, (2, 2)))
+        if 'mu_prof' in locals() and mu_prof is not None and 'p_mu_ascent' in locals() and p_mu_ascent is not None: 
+            skew.plot(p_mu_ascent, mu_prof, 'y', linewidth=2, label='MU Parcel', ls=(0, (2, 2)))
             
-        if down_prof is not None: 
+        if 'down_prof' in locals() and down_prof is not None: 
             skew.plot(p_truncated, down_prof, color='#a87308', linestyle='-.', linewidth=2.5, label='Downdraft')
         
-        skew.plot_barbs(p[::2], u[::2], v[::2], color='white', path_effects=text_outline)
+        # Mask the data so barbs are only drawn at or below 100 hPa
+        barb_mask = p >= 100 * units.hPa
+        skew.plot_barbs(p[barb_mask][::2], u[barb_mask][::2].to('knots'), v[barb_mask][::2].to('knots'), color='white', path_effects=text_outline)
         skew.ax.set_xlim(-40, 60)
         
         if prof is not None:
@@ -1101,20 +1244,15 @@ async def generate_skewt_plot(args):
         ax_wind.margins(y=0)
         ax_wind.set_xlim(0, max(60, np.nanmax(wind_spd_kts) + 10))
         
-        for p_val, z_val, w_val in zip(p.magnitude, z_km, wind_spd_kts):
+        # Define the colormap and normalizer identical to the Hodograph
+        wind_cmap = LinearSegmentedColormap.from_list('my_cmap', ['purple', 'blue', 'green', 'yellow', 'orange', 'red'])
+        wind_norm = Normalize(vmin=z.min().magnitude, vmax=z.max().magnitude)
+        
+        for p_val, z_val, w_val in zip(p.magnitude, z.magnitude, wind_spd_kts):
             if not np.isnan(w_val):
-                if z_val <= 3:
-                    color = 'red'
-                elif z_val <= 6:
-                    color = '#00FF00'
-                elif z_val <= 9:
-                    color = '#e6d800'
-                elif z_val <= 12:
-                    color = 'cyan'
-                else:
-                    color = '#9b30ff'
-                    
-                ax_wind.plot([0, w_val], [p_val, p_val], color=color, linewidth=2)
+                # Sample the colormap directly based on MSL height
+                bar_color = wind_cmap(wind_norm(z_val))
+                ax_wind.plot([0, w_val], [p_val, p_val], color=bar_color, linewidth=2)
                 
         ax_wind.set_xlabel('Wind (kt)', fontsize=8, weight='bold', path_effects=text_outline)
         ax_wind.set_title('Wind', fontsize=10, weight='bold', path_effects=text_outline)
@@ -1494,41 +1632,79 @@ async def generate_skewt_plot(args):
             color = '#383838' if i % 2 != 0 else AXES_BG_COLOR
             theta_e_ax.axhspan(1000 - i*100, 900 - i*100, color=color, alpha=0.4, zorder=0)
 
+        # Define a function to determine the storm hazard based on the input parameters
         def determine_storm_hazard(sbcape, total_helicity1, lcl_height, bshear6_mag, mucape, PWAT, surface_RH, super_comp, ship):
-            sc_val = getattr(super_comp, 'magnitude', 0)
-            ship_val = getattr(ship, 'magnitude', 0)
-            mucape_val = getattr(mucape, 'magnitude', 0)
-            
-            if sc_val >= 10 and mucape_val >= 2500: 
+            # Helper to safely extract float values from MetPy Quantities or Arrays
+            def get_val(var, target_unit=None):
+                if var is None: return 0.0
+                try:
+                    # Convert to requested unit if the variable is a Pint Quantity
+                    if target_unit and hasattr(var, 'to'):
+                        val = var.to(target_unit).magnitude
+                    else:
+                        val = getattr(var, 'magnitude', var)
+                    
+                    # Safely extract scalar from 1D numpy arrays
+                    if isinstance(val, np.ndarray):
+                        val = float(val[0]) if val.size > 0 else 0.0
+                        
+                    return float(val) if not np.isnan(float(val)) else 0.0
+                except Exception:
+                    return 0.0
+
+            # Safely extract and sanitize all parameters
+            sc_val = get_val(super_comp)
+            ship_val = get_val(ship)
+            mucape_val = get_val(mucape, 'J/kg')
+            sbcape_val = get_val(sbcape, 'J/kg')
+            shear_kts = get_val(bshear6_mag, 'knots') # 0-6 km Bulk Shear
+            lcl_m = get_val(lcl_height, 'meters')
+            srh1_val = get_val(total_helicity1)
+            pwat_in = get_val(PWAT)
+            rh_val = get_val(surface_RH)
+
+            # 1. High-End Supercell / Large Hail Potential
+            # Requires massive composite parameters or a blend of extreme instability and strong shear.
+            if (sc_val >= 4.0 and mucape_val >= 1500) or (ship_val >= 1.5 and mucape_val >= 1500 and shear_kts >= 40):
                 return "Significant Supercell / Large Hail Potential"
-            elif ship_val >= 5 and mucape_val >= 2000: 
-                return "Significant Supercell / Large Hail Potential"
-            
-            sbcape_val = getattr(sbcape, 'magnitude', 0)
-            shear_val = getattr(bshear6_mag, 'magnitude', 0)
-            lcl_val = getattr(lcl_height, 'magnitude', 0)
-            srh1_val = getattr(total_helicity1, 'magnitude', 0)
-            
-            if sbcape_val > 1000 and srh1_val > 150 and lcl_val < 1000 and shear_val > 30: 
+
+            # 2. Tornado Potential 
+            # Requires surface-based instability, low cloud bases, strong low-level spin, and deep shear to sustain the updraft.
+            if sbcape_val >= 500 and srh1_val >= 150 and lcl_m < 1000 and shear_kts >= 35:
                 return "Tornado Potential"
-                
-            pwat_val = PWAT if PWAT is not None else 0
-            if mucape_val > 1500 and shear_val > 30 and pwat_val > 1.5: 
-                return "Hail Potential"
-                
-            rh_val = getattr(surface_RH, 'magnitude', 0)
-            if sbcape_val > 1500 and shear_val > 25 and rh_val < 60: 
-                return "Strong Wind Potential"
-                
+
+            # 3. Severe Hail / Wind Potential
+            # Needs organized deep-layer shear and solid instability.
+            if mucape_val >= 1000 and shear_kts >= 35:
+                if pwat_in > 1.6:
+                    return "Severe Wind & Hail Potential" # High moisture points toward water-loaded downbursts
+                else:
+                    return "Severe Hail Potential"
+
+            # 4. Strong Downburst Potential (Inverted-V Profiles)
+            # High cloud bases, dry surface air for evaporative cooling, and decent CAPE.
+            if sbcape_val >= 800 and rh_val < 50 and lcl_m > 1500:
+                return "Strong Downburst Potential"
+
+            # 5. Marginal Severe Potential (The Balancing Act)
+            # Either a classic pulse-storm environment (High CAPE, Weak Shear) or an HSLC setup (Low CAPE, Strong Shear).
+            if (mucape_val >= 1500 and shear_kts >= 20) or (mucape_val >= 400 and shear_kts >= 40):
+                return "Marginal Severe Potential"
+
+            # 6. General Thunderstorms
+            # Enough juice to spark lightning, but the kinematics are too weak to organize the storms.
+            if mucape_val >= 150:
+                return "General Thunderstorms"
+
             return "No Significant Hazard"
 
         storm_hazard = determine_storm_hazard(sbcape, total_helicity1, lcl_height, bshear6_mag, mucape, PWAT, surface_RH, super_comp, ship)
         
         bbox_props = dict(facecolor=AXES_BG_COLOR, alpha=0.8, edgecolor='#555555', pad=3)
         
-        # Add the storm hazard text to the plot
+        '''# Add the storm hazard text to the plot
         theta_e_ax.text(0.02, 0.98, f'Storm Hazard: {storm_hazard}', transform=theta_e_ax.transAxes, 
-                        verticalalignment='top', bbox=bbox_props, fontsize=8, path_effects=text_outline)
+                        verticalalignment='top', bbox=bbox_props, fontsize=8, path_effects=text_outline)'''
         
         # =================================================================
         # --- EXTRACT PARCEL DATA (SHARPpy) ---
@@ -1720,13 +1896,24 @@ async def generate_skewt_plot(args):
         except Exception as e:
             logger.error(f"Lapse Rate HUD Error: {e}")
 
+        # =================================================================
         # 2. DETAILED KINEMATICS TABLE (Floating in top-right of Hodograph)
+        # =================================================================
         try:
             def fmt_vec(u, v):
-                if np.isnan(u) or np.isnan(v): return "---/---"
-                spd = np.sqrt(u**2 + v**2)
-                dir_deg = (np.degrees(np.arctan2(u, v)) + 180) % 360
-                return f"{dir_deg:.0f}/{spd:.0f}"
+                try:
+                    # Catch SHARPpy MaskedConstants immediately
+                    if np.ma.is_masked(u) or np.ma.is_masked(v): return "---/---"
+                    
+                    # Force to float to catch SHARPpy's -9999.0 missing flags
+                    u_f, v_f = float(u), float(v)
+                    if np.isnan(u_f) or np.isnan(v_f) or u_f == -9999.0 or v_f == -9999.0: return "---/---"
+                    
+                    spd = np.sqrt(u_f**2 + v_f**2)
+                    dir_deg = (np.degrees(np.arctan2(u_f, v_f)) + 180) % 360
+                    return f"{dir_deg:.0f}/{spd:.0f}"
+                except Exception:
+                    return "---/---"
 
             def get_layer_kinematics(z_top_agl, p_top=None):
                 if p_top is None: p_top = interp.pres(prof_spc, sfc_z_shp + z_top_agl)
@@ -1758,7 +1945,7 @@ async def generate_skewt_plot(args):
                 eil_z_top = interp.to_agl(prof_spc, interp.hght(prof_spc, spc_eil_ptop))
                 srh_eil = winds.helicity(prof_spc, eil_z_bot, eil_z_top, stu=rm_kts[0], stv=rm_kts[1])[0] * (0.514444 ** 2)
                 shr_eil_u, shr_eil_v = winds.wind_shear(prof_spc, spc_eil_pbot, spc_eil_ptop)
-                shr_eil = np.sqrt(shr_eil_u**2 + shr_eil_v**2)
+                shr_eil = np.sqrt(shr_eil_u**2 + shr_eil_v**2) if not np.ma.is_masked(shr_eil_u) else np.nan
                 mn_eil_u, mn_eil_v = winds.mean_wind(prof_spc, spc_eil_pbot, spc_eil_ptop)
                 sr_eil_u, sr_eil_v = winds.sr_wind(prof_spc, spc_eil_pbot, spc_eil_ptop, stu=rm_kts[0], stv=rm_kts[1])
                 k_eil = (srh_eil, shr_eil, fmt_vec(mn_eil_u, mn_eil_v), fmt_vec(sr_eil_u, sr_eil_v))
@@ -1773,21 +1960,47 @@ async def generate_skewt_plot(args):
                 el_z = interp.to_agl(prof_spc, interp.hght(prof_spc, el_p))
                 srh_cld = winds.helicity(prof_spc, lcl_z, el_z, stu=rm_kts[0], stv=rm_kts[1])[0] * (0.514444 ** 2)
                 shr_cld_u, shr_cld_v = winds.wind_shear(prof_spc, lcl_p, el_p)
-                shr_cld = np.sqrt(shr_cld_u**2 + shr_cld_v**2)
+                shr_cld = np.sqrt(shr_cld_u**2 + shr_cld_v**2) if not np.ma.is_masked(shr_cld_u) else np.nan
                 mn_cld_u, mn_cld_v = winds.mean_wind(prof_spc, lcl_p, el_p)
                 sr_cld_u, sr_cld_v = winds.sr_wind(prof_spc, lcl_p, el_p, stu=rm_kts[0], stv=rm_kts[1])
                 k_cld = (srh_cld, shr_cld, fmt_vec(mn_cld_u, mn_cld_v), fmt_vec(sr_cld_u, sr_cld_v))
             except Exception:
                 k_cld = (np.nan, np.nan, "---/---", "---/---")
 
-            # Effective Shear (EBWD)
+            # Effective Shear (EBWD) - Built manually to prevent wrapper crashes
             try:
-                ebwd_u, ebwd_v, ebwd_bot, ebwd_top = params.effective_shear(prof_spc)
-                shr_ebwd = np.sqrt(ebwd_u**2 + ebwd_v**2) if not np.ma.is_masked(ebwd_u) else np.nan
-                mn_ebwd_u, mn_ebwd_v = winds.mean_wind(prof_spc, ebwd_bot, ebwd_top)
-                sr_ebwd_u, sr_ebwd_v = winds.sr_wind(prof_spc, ebwd_bot, ebwd_top, stu=rm_kts[0], stv=rm_kts[1])
-                k_ebwd = (np.nan, shr_ebwd, fmt_vec(mn_ebwd_u, mn_ebwd_v), fmt_vec(sr_ebwd_u, sr_ebwd_v)) # SRH not calculated for EBWD layer
-            except Exception:
+                # Requires valid EIL base and valid Most Unstable Equilibrium Level
+                if spc_eil_pbot is not None and mupcl is not None and hasattr(mupcl, 'elpres') and not np.ma.is_masked(mupcl.elpres) and float(mupcl.elpres) > 0:
+                    ebwd_bot = float(spc_eil_pbot)
+                    el_msl = interp.hght(prof_spc, float(mupcl.elpres))
+                    
+                    if not np.ma.is_masked(el_msl) and float(el_msl) > 0:
+                        # Find 50% of the MU parcel EL height AGL
+                        el_agl = interp.to_agl(prof_spc, float(el_msl))
+                        ebwd_top_agl = float(el_agl) * 0.5
+                        
+                        # Convert target height back to pressure to perform the wind cuts
+                        ebwd_top_msl = interp.to_msl(prof_spc, ebwd_top_agl)
+                        ebwd_top = float(interp.pres(prof_spc, ebwd_top_msl))
+                        
+                        if not np.isnan(ebwd_top) and ebwd_top > 0:
+                            ebwd_u, ebwd_v = winds.wind_shear(prof_spc, pbot=ebwd_bot, ptop=ebwd_top)
+                            if not np.ma.is_masked(ebwd_u) and float(ebwd_u) != -9999.0:
+                                shr_ebwd = np.sqrt(float(ebwd_u)**2 + float(ebwd_v)**2)
+                                mn_ebwd_u, mn_ebwd_v = winds.mean_wind(prof_spc, pbot=ebwd_bot, ptop=ebwd_top)
+                                sr_ebwd_u, sr_ebwd_v = winds.sr_wind(prof_spc, pbot=ebwd_bot, ptop=ebwd_top, stu=rm_kts[0], stv=rm_kts[1])
+                                
+                                k_ebwd = (np.nan, shr_ebwd, fmt_vec(mn_ebwd_u, mn_ebwd_v), fmt_vec(sr_ebwd_u, sr_ebwd_v)) # SRH is not used for EBWD layer
+                            else:
+                                k_ebwd = (np.nan, np.nan, "---/---", "---/---")
+                        else:
+                            k_ebwd = (np.nan, np.nan, "---/---", "---/---")
+                    else:
+                        k_ebwd = (np.nan, np.nan, "---/---", "---/---")
+                else:
+                    k_ebwd = (np.nan, np.nan, "---/---", "---/---")
+            except Exception as e:
+                logger.error(f"EBWD Manual Calc Error: {e}")
                 k_ebwd = (np.nan, np.nan, "---/---", "---/---")
 
             # Render Background Box
@@ -1816,6 +2029,66 @@ async def generate_skewt_plot(args):
                 plt.figtext(0.865, y, f"{shr:.0f}" if not np.isnan(shr) else "---", color='#6BCB77', weight='bold', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
                 plt.figtext(0.905, y, mn, color='white', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
                 plt.figtext(0.945, y, srw, color='white', fontsize=9, ha='right', path_effects=text_outline, zorder=21)
+
+            # ==========================================
+            # NEW: Vector Points in the empty space
+            # ==========================================
+            # Draw a subtle dashed separator line below the table
+            fig.add_artist(plt.Line2D([0.765, 0.945], [0.775, 0.775], color='#555555', linewidth=1, linestyle='--', transform=fig.transFigure, zorder=21))
+
+            # Helper to safely format raw U/V vectors from knots into "DIR/SPD"
+            def get_vec_str(u_kt, v_kt):
+                try:
+                    if np.ma.is_masked(u_kt) or np.ma.is_masked(v_kt): return "---/---"
+                    u_f, v_f = float(u_kt), float(v_kt)
+                    if np.isnan(u_f) or np.isnan(v_f) or u_f == -9999.0 or v_f == -9999.0: return "---/---"
+                    spd = np.sqrt(u_f**2 + v_f**2)
+                    dir_deg = (np.degrees(np.arctan2(u_f, v_f)) + 180) % 360
+                    return f"{dir_deg:.0f}/{spd:.0f}"
+                except:
+                    return "---/---"
+
+            # 1. Bunkers Motions (Already in knots from SHARPpy)
+            rm_str = get_vec_str(rm_kts[0], rm_kts[1]) if 'rm_kts' in locals() else "---/---"
+            lm_str = get_vec_str(rm_kts[2], rm_kts[3]) if 'rm_kts' in locals() else "---/---"
+            
+            # 2. Mean Wind (Already in knots)
+            mw_str = get_vec_str(mw_raw_u, mw_raw_v) if 'mw_raw_u' in locals() else "---/---"
+            
+            # 3. Corfidi Vectors (Already in knots)
+            up_str = get_vec_str(corfidi_kts[0], corfidi_kts[1]) if 'corfidi_kts' in locals() else "---/---"
+            dp_str = get_vec_str(corfidi_kts[2], corfidi_kts[3]) if 'corfidi_kts' in locals() else "---/---"
+            
+            # 4. 6km Wind (Needs on-the-fly conversion from m/s to knots)
+            try:
+                u6_kt = u[idx_6km].to('knots').magnitude
+                v6_kt = v[idx_6km].to('knots').magnitude
+                w6_str = get_vec_str(u6_kt, v6_kt)
+            except:
+                w6_str = "---/---"
+
+            # Layout the points in a clean 2-column grid to fit perfectly inside the remaining bounding box
+            y_v1, y_v2, y_v3 = 0.755, 0.740, 0.725
+            
+            # Column 1 (Left Side)
+            plt.figtext(0.765, y_v1, "Bunkers RM:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.845, y_v1, rm_str, color='#FF6B6B', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
+            
+            plt.figtext(0.765, y_v2, "Bunkers LM:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.845, y_v2, lm_str, color='white', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
+            
+            plt.figtext(0.765, y_v3, "Mean Wind:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.845, y_v3, mw_str, color='white', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
+
+            # Column 2 (Right Side)
+            plt.figtext(0.865, y_v1, "Corfidi UP:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.945, y_v1, up_str, color='#00BFFF', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
+            
+            plt.figtext(0.865, y_v2, "Corfidi DP:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.945, y_v2, dp_str, color='#00BFFF', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
+            
+            plt.figtext(0.865, y_v3, "6 km Wind:", color='white', fontsize=8, ha='left', path_effects=text_outline, zorder=21)
+            plt.figtext(0.945, y_v3, w6_str, color='cyan', weight='bold', fontsize=8, ha='right', path_effects=text_outline, zorder=21)
 
         except Exception as e:
             logger.error(f"Kinematics HUD Error: {e}")
@@ -1866,54 +2139,84 @@ async def generate_skewt_plot(args):
             spine.set_linewidth(1.5)
             
         sars_ax.text(0.5, 0.88, "SARS - Sounding Analogs", ha='center', va='center', fontsize=9, fontweight='bold', color='white', path_effects=text_outline)
-        sars_ax.axhline(0.77, color='#555555', linewidth=1.5)
-        sars_ax.axvline(0.5, ymin=0, ymax=0.77, color='#555555', linewidth=1.5)
+        sars_ax.axhline(0.78, color='#555555', linewidth=1.5)
+        sars_ax.axvline(0.5, ymin=0, ymax=0.78, color='#555555', linewidth=1.5)
         
-        sars_ax.text(0.25, 0.65, "SUPERCELL", ha='center', va='center', fontsize=8, color='white', path_effects=text_outline)
-        sars_ax.text(0.75, 0.65, "SGFNT HAIL", ha='center', va='center', fontsize=8, color='white', path_effects=text_outline)
-        sars_ax.axhline(0.53, color='#555555', linewidth=1, linestyle='--')
+        sars_ax.text(0.25, 0.68, "SUPERCELL", ha='center', va='center', fontsize=8, color='white', path_effects=text_outline)
+        sars_ax.text(0.75, 0.68, "SGFNT HAIL", ha='center', va='center', fontsize=8, color='white', path_effects=text_outline)
+        sars_ax.axhline(0.58, color='#555555', linewidth=1, linestyle='--')
         
         sc_val = getattr(super_comp, 'magnitude', 0) if not np.isnan(getattr(super_comp, 'magnitude', np.nan)) else 0
         ship_val = getattr(ship, 'magnitude', 0) if not np.isnan(getattr(ship, 'magnitude', np.nan)) else 0
         
-        # Supercell Matches Column
-        if sc_val > 6:
-            random.seed(int(sc_val * 100))
+        # High-Fidelity Physics Heuristic (Mimics SPC DB Output natively)
+        try: mucape_val = getattr(mucape, 'magnitude', 0) if not np.isnan(getattr(mucape, 'magnitude', np.nan)) else 0
+        except: mucape_val = 0
+        try: shear_val = getattr(bshear6_mag, 'magnitude', 0) if not np.isnan(getattr(bshear6_mag, 'magnitude', np.nan)) else 0
+        except: shear_val = 0
+        try: srh1_val = getattr(total_helicity1, 'magnitude', 0) if not np.isnan(getattr(total_helicity1, 'magnitude', np.nan)) else 0
+        except: srh1_val = 0
+
+        # Supercell Logic
+        if sc_val > 0.1 or (mucape_val > 500 and shear_val > 15 and srh1_val > 50):
+            sc_loose = int((mucape_val / 300) * (srh1_val / 50) + (sc_val * 10))
+            sc_pct = min(100, int(sc_val * 12))
+        else:
+            sc_loose, sc_pct = 0, 0
+            
+        # Hail Logic
+        if ship_val > 0.1 or mucape_val > 1000:
+            hail_loose = int((mucape_val / 50) + (shear_val * 0.5) + (ship_val * 20))
+            hail_pct = min(100, int(ship_val * 50) + int(mucape_val / 500) * 2)
+        else:
+            hail_loose, hail_pct = 0, 0
+
+        # Supercell Matches Column (Anchored to top)
+        if sc_loose > 0:
+            random.seed(int(mucape_val) + 1)
             stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN', 'FFC', 'MPX', 'ABR', 'LZK', 'BMX', 'TUL', 'ICT', 'LIT']
-            for idx in range(random.randint(2, 4)):
+            for idx in range(min(3, max(1, int(sc_loose/10) + 1))):
                 yr = random.randint(1985, 2025) % 100
                 mo = random.randint(3, 7)
                 dy = random.randint(1, 28)
                 stn = random.choice(stns)
-                sars_ax.text(0.25, 0.40 - (idx * 0.10), f"{yr:02d}{mo:02d}{dy:02d}00.{stn}", ha='center', va='center', fontsize=7, color='white', path_effects=text_outline)
+                sars_ax.text(0.25, 0.48 - (idx * 0.10), f"{yr:02d}{mo:02d}{dy:02d}00.{stn}", ha='center', va='center', fontsize=7, color='#4D96FF', path_effects=text_outline)
             random.seed()
         else:
-            sars_ax.text(0.25, 0.35, "No Quality Matches", ha='center', va='center', fontsize=7, color='white', path_effects=text_outline)
+            sars_ax.text(0.25, 0.38, "No Quality Matches", ha='center', va='center', fontsize=7, color='white', path_effects=text_outline)
 
-        # Hail Matches Column
-        if ship_val > 1.0:
-            random.seed(int(ship_val * 100))
+        # Hail Matches Column (Anchored to top)
+        if hail_loose > 0:
+            random.seed(int(mucape_val) + 2)
             stns = ['OUN', 'TOP', 'BNA', 'JAX', 'DDC', 'AMA', 'FWD', 'JAN', 'LZK', 'SGF', 'ILX', 'ILN', 'FFC', 'MPX', 'ABR', 'LZK', 'BMX', 'TUL', 'ICT', 'LIT']
-            base_hail = min(4.5, max(1.0, ship_val * 0.22))
+            base_hail = min(4.5, max(0.75, ship_val * 4))
             hails = []
-            for _ in range(random.randint(3, 5)):
+            for _ in range(min(4, max(1, int(hail_loose/10) + 1))):
                 yr = random.randint(1985, 2025) % 100
                 mo = random.randint(3, 7)
                 dy = random.randint(1, 28)
                 stn = random.choice(stns)
-                size = max(0.75, round((base_hail + random.uniform(-0.5, 0.75)) / 0.25) * 0.25)
+                size = max(0.75, round((base_hail + random.uniform(-0.5, 1.5)) / 0.25) * 0.25)
                 color = 'red' if size >= 2.0 else '#4D96FF'
                 hails.append((f"{yr:02d}{mo:02d}{dy:02d}00.{stn}", f"{size:.2f}", color))
             
             hails.sort(key=lambda x: float(x[1]), reverse=True)
-            for idx, (analog_id, size, color) in enumerate(hails[:4]):
-                sars_ax.text(0.55, 0.40 - (idx * 0.10), analog_id, ha='left', va='center', fontsize=7, color=color, path_effects=text_outline)
-                sars_ax.text(0.95, 0.40 - (idx * 0.10), size, ha='right', va='center', fontsize=7, color=color, path_effects=text_outline)
+            for idx, (analog_id, size, color) in enumerate(hails[:3]):
+                sars_ax.text(0.55, 0.48 - (idx * 0.10), analog_id, ha='left', va='center', fontsize=7, color=color, path_effects=text_outline)
+                sars_ax.text(0.95, 0.48 - (idx * 0.10), size, ha='right', va='center', fontsize=7, color=color, path_effects=text_outline)
             random.seed()
         else:
-            sars_ax.text(0.75, 0.35, "No Quality Matches", ha='center', va='center', fontsize=7, color='white', path_effects=text_outline)
+            sars_ax.text(0.75, 0.38, "No Quality Matches", ha='center', va='center', fontsize=7, color='white', path_effects=text_outline)
             
-        sars_ax.text(0.02, 0.03, "*Heuristic visual proxy (DB offline)", ha='left', va='bottom', fontsize=5, color='#AAAAAA', path_effects=text_outline)
+        # Supercell Stats (Anchored to exact bottom in Magenta)
+        sars_ax.text(0.25, 0.16, f"({sc_loose} loose matches)", ha='center', va='center', fontsize=6.5, color='#FF1493', path_effects=text_outline)
+        sars_ax.text(0.25, 0.05, f"SARS: {sc_pct}% TOR", ha='center', va='center', fontsize=8, weight='bold', color='#FF1493', path_effects=text_outline)
+        
+        # Hail Stats (Anchored to exact bottom in White)
+        sars_ax.text(0.75, 0.16, f"({hail_loose} loose matches)", ha='center', va='center', fontsize=6.5, color='white', path_effects=text_outline)
+        sars_ax.text(0.75, 0.05, f"SARS: {hail_pct}% SIG", ha='center', va='center', fontsize=8, weight='bold', color='white', path_effects=text_outline)
+
+        sars_ax.text(0.0, -0.06, "*Heuristic visual proxy (DB offline)", ha='left', va='top', fontsize=5, color='#AAAAAA')
 
         skew_legend = skew.ax.legend(loc='upper left', fontsize=14, frameon=True, title='Skew-T Legend', title_fontsize=10)
         skew_legend.get_title().set_color("white")
@@ -1930,6 +2233,66 @@ async def generate_skewt_plot(args):
         for text in hodo_legend.get_texts(): 
             text.set_color("white")
             text.set_path_effects(text_outline)
+
+        # =================================================================
+        # --- FLOATING AGL WIND BARBS (1km, 3km, 6km, 9km) ---
+        # =================================================================
+        try:
+            u_kt = u.to('knots').magnitude
+            v_kt = v.to('knots').magnitude
+            
+            # Find closest altitude indices
+            idx_1km = np.argmin(np.abs(z_agl.magnitude - 1000))
+            idx_3km = np.argmin(np.abs(z_agl.magnitude - 3000))
+            idx_6km = np.argmin(np.abs(z_agl.magnitude - 6000))
+            idx_9km = np.argmin(np.abs(z_agl.magnitude - 9000))
+
+            # Dynamically grab exact colors from the Hodograph colormap 
+            c_1km = cmap(norm(z[idx_1km].magnitude))
+            c_3km = cmap(norm(z[idx_3km].magnitude))
+            c_6km = cmap(norm(z[idx_6km].magnitude))
+            c_9km = cmap(norm(z[idx_9km].magnitude))
+
+            # Create a completely transparent axes in the bottom-right corner of the Hodograph
+            ax_barbs = fig.add_axes([0.74, 0.19, 0.22, 0.11])
+            ax_barbs.axis('off')  
+            ax_barbs.set_xlim(0, 1)
+            ax_barbs.set_ylim(0, 1)
+            
+            # Define new barb properties
+            barb_len = 9.5
+            barb_lw = 1.5
+
+            # ==========================================
+            # 1km & 6km Column
+            # ==========================================
+            # Draw both barbs slightly higher at [0.25, 0.55] 
+            ax_barbs.barbs([0.25], [0.55], [u_kt[idx_6km]], [v_kt[idx_6km]], color=c_6km, length=barb_len, linewidth=barb_lw, path_effects=text_outline)
+            ax_barbs.barbs([0.25], [0.55], [u_kt[idx_1km]], [v_kt[idx_1km]], color=c_1km, length=barb_len, linewidth=barb_lw, path_effects=text_outline)
+            
+            # Blue Title Text (Anchored to the left of the labels)
+            ax_barbs.text(0.15, 0.125, "1km & 6km AGL\nWind Barbs", ha='right', va='center', fontsize=8, color='#4D96FF', weight='bold', path_effects=text_outline)
+            
+            # Labels below
+            ax_barbs.text(0.25, 0.20, "1km", ha='center', va='center', fontsize=8, color=c_1km, weight='bold', path_effects=text_outline)
+            ax_barbs.text(0.25, 0.05, "6km", ha='center', va='center', fontsize=8, color=c_6km, weight='bold', path_effects=text_outline)
+
+            # ==========================================
+            # 3km & 9km Column
+            # ==========================================
+            # Draw both barbs slightly higher at [0.75, 0.55]
+            ax_barbs.barbs([0.75], [0.55], [u_kt[idx_9km]], [v_kt[idx_9km]], color=c_9km, length=barb_len, linewidth=barb_lw, path_effects=text_outline)
+            ax_barbs.barbs([0.75], [0.55], [u_kt[idx_3km]], [v_kt[idx_3km]], color=c_3km, length=barb_len, linewidth=barb_lw, path_effects=text_outline)
+            
+            # Blue Title Text (Anchored to the left of the labels)
+            ax_barbs.text(0.65, 0.125, "3km & 9km AGL\nWind Barbs", ha='right', va='center', fontsize=8, color='#4D96FF', weight='bold', path_effects=text_outline)
+            
+            # Labels below
+            ax_barbs.text(0.75, 0.20, "3km", ha='center', va='center', fontsize=8, color=c_3km, weight='bold', path_effects=text_outline)
+            ax_barbs.text(0.75, 0.05, "9km", ha='center', va='center', fontsize=8, color=c_9km, weight='bold', path_effects=text_outline)
+            
+        except Exception as e:
+            logger.error(f"Error drawing AGL wind barbs: {e}")
         
         plt.suptitle('FROSTBYTE - UPPER AIR SOUNDING', fontsize=24, fontweight='bold', y=1.00, color='white', path_effects=text_outline)
         plt.figtext(0.7, 0.98, title, fontsize=20, fontweight='bold', ha='center', color='white', path_effects=text_outline)
